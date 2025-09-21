@@ -17,12 +17,6 @@ from .tools import (
     find_product_alternatives,
     get_subscription_products,
     explain_subscription_options,
-    create_whatsapp_buttons,
-    create_whatsapp_list,
-    create_product_showcase,
-    create_cart_summary,
-    format_checkout_message,
-    create_greeting_message
 )
 
 
@@ -54,13 +48,6 @@ root_agent = Agent(
         get_product_recommendations,
         find_product_alternatives,
         get_subscription_products,
-        explain_subscription_options,
-        # WhatsApp formatting tools
-        create_whatsapp_buttons,
-        create_whatsapp_list,
-        create_product_showcase,
-        create_cart_summary,
-        format_checkout_message,
-        create_greeting_message
+        explain_subscription_options
     ],
 )

@@ -371,6 +371,39 @@ def create_cart(
     Returns:
         Dict[str, Any]: Cart creation result with cart ID and checkout URL
     """
+    # Input validation
+    if not lines or not isinstance(lines, list):
+        return {
+            "status": "error",
+            "error_message": "I need at least one product to create a cart. What would you like to add?"
+        }
+    
+    # Validate each line item
+    for i, line in enumerate(lines):
+        if not isinstance(line, dict):
+            return {
+                "status": "error",
+                "error_message": f"Invalid product information for item {i+1}. Please check the product details."
+            }
+        
+        if not line.get('merchandiseId'):
+            return {
+                "status": "error", 
+                "error_message": f"Missing product variant ID for item {i+1}. Please select a specific product variant."
+            }
+        
+        quantity = line.get('quantity', 1)
+        if not isinstance(quantity, int) or quantity < 1:
+            return {
+                "status": "error",
+                "error_message": f"Invalid quantity for item {i+1}. Quantity must be a positive number."
+            }
+        
+        if quantity > 100:  # Reasonable limit
+            return {
+                "status": "error",
+                "error_message": f"Quantity too high for item {i+1}. Maximum 100 items per product allowed."
+            }
     query = """
     mutation cartCreate($input: CartInput!) {
         cartCreate(input: $input) {
@@ -759,6 +792,29 @@ def search_products(
     Returns:
         Dict[str, Any]: Search results with products
     """
+    # Input validation
+    if not query or not isinstance(query, str):
+        return {
+            "status": "error",
+            "error_message": "Please tell me what you're looking for so I can find the perfect products for you!"
+        }
+    
+    # Clean and validate search query
+    cleaned_query = query.strip()
+    if len(cleaned_query) < 2:
+        return {
+            "status": "error",
+            "error_message": "Please provide at least 2 characters to search for products."
+        }
+    
+    if len(cleaned_query) > 200:  # Reasonable limit
+        cleaned_query = cleaned_query[:200]
+    
+    # Validate and limit first parameter
+    if not isinstance(first, int) or first < 1:
+        first = 20
+    elif first > 100:  # Reasonable limit
+        first = 100
     graphql_query = """
     query searchProducts($query: String!, $first: Int!) {
         products(first: $first, query: $query) {
@@ -824,7 +880,7 @@ def search_products(
     """
     
     variables = {
-        "query": query,
+        "query": cleaned_query,
         "first": first
     }
     
@@ -832,13 +888,30 @@ def search_products(
     
     if result["status"] == "success":
         products_data = result["data"].get("products", {})
+        products = products_data.get("edges", [])
+        
+        # Provide helpful feedback when no products found
+        if not products:
+            return {
+                "status": "success",
+                "products": [],
+                "search_query": cleaned_query,
+                "message": f"I couldn't find any products matching '{cleaned_query}'. Try different keywords or browse our categories!"
+            }
+        
         return {
-            "status": "success",
-            "products": products_data.get("edges", []),
-            "search_query": query
+            "status": "success", 
+            "products": products,
+            "search_query": cleaned_query,
+            "total_found": len(products)
         }
     
-    return result
+    # Handle search failures gracefully
+    error_msg = result.get("error_message", "Search temporarily unavailable")
+    return {
+        "status": "error",
+        "error_message": f"I'm having trouble searching right now. Please try again in a moment! ({error_msg})"
+    }
 
 
 def calculate_shipping_estimate(
@@ -849,7 +922,8 @@ def calculate_shipping_estimate(
     access_token: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Calculates shipping estimate for a cart to a specific address.
+    Calculates shipping estimate by creating a temporary checkout to get shipping rates.
+    This is the proper way to get shipping estimates in Shopify.
     
     Args:
         cart_id (str): The ID of the cart
@@ -859,13 +933,57 @@ def calculate_shipping_estimate(
         access_token (Optional[str]): The Shopify Storefront access token
     
     Returns:
-        Dict[str, Any]: Shipping estimate information
+        Dict[str, Any]: Shipping estimate with available shipping rates
     """
-    query = """
+    # Validate required address fields
+    required_fields = ['country']
+    missing_fields = [field for field in required_fields if not address.get(field)]
+    if missing_fields:
+        return {
+            "status": "error",
+            "error_message": f"I need a country to calculate shipping rates. Could you please provide your country?"
+        }
+    
+    # First check if cart exists and has items
+    cart_check = get_cart(cart_id, shop, api_version, access_token)
+    if cart_check["status"] != "success":
+        return {
+            "status": "error", 
+            "error_message": "I couldn't find your cart. Please add some items first, then I can calculate shipping costs."
+        }
+    
+    cart_data = cart_check.get("cart_data", {})
+    lines = cart_data.get("lines", {}).get("edges", [])
+    if not lines:
+        return {
+            "status": "error",
+            "error_message": "Your cart is empty. Please add some items first, then I can calculate shipping costs."
+        }
+    
+    # Use the proper approach: get available shipping rates through checkout
+    # First, set the shipping address on the cart
+    address_query = """
     mutation cartShippingAddressUpdate($cartId: ID!, $address: MailingAddressInput!) {
         cartShippingAddressUpdate(cartId: $cartId, address: $address) {
             cart {
                 id
+                checkoutUrl
+                deliveryGroups(first: 5) {
+                    edges {
+                        node {
+                            id
+                            deliveryOptions {
+                                estimatedCost {
+                                    amount
+                                    currencyCode
+                                }
+                                handle
+                                title
+                                description
+                            }
+                        }
+                    }
+                }
                 cost {
                     totalAmount {
                         amount
@@ -879,18 +997,6 @@ def calculate_shipping_estimate(
                         amount
                         currencyCode
                     }
-                    totalDutyAmount {
-                        amount
-                        currencyCode
-                    }
-                }
-                shippingAddress {
-                    address1
-                    address2
-                    city
-                    country
-                    province
-                    zip
                 }
             }
             userErrors {
@@ -906,27 +1012,92 @@ def calculate_shipping_estimate(
         "address": address
     }
     
-    result = fetch_shopify_storefront_graphql(query, variables, shop, api_version, access_token)
+    try:
+        result = fetch_shopify_storefront_graphql(address_query, variables, shop, api_version, access_token)
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"I'm having trouble connecting to calculate shipping rates. Please try again in a moment!"
+        }
     
     if result["status"] == "success":
-        cart_data = result["data"].get("cartShippingAddressUpdate", {})
-        cart = cart_data.get("cart")
-        user_errors = cart_data.get("userErrors", [])
+        cart_update_data = result["data"].get("cartShippingAddressUpdate", {})
+        updated_cart = cart_update_data.get("cart")
+        user_errors = cart_update_data.get("userErrors", [])
         
         if user_errors:
+            # Check if it's an address validation error
+            address_errors = [err for err in user_errors if 'address' in err.get('field', '').lower()]
+            if address_errors:
+                return {
+                    "status": "error",
+                    "error_message": "I need a more complete address to calculate accurate shipping rates. Could you provide your city and postal code?"
+                }
             return {
                 "status": "error",
-                "error_message": f"Shipping calculation errors: {user_errors}"
+                "error_message": f"I'm having trouble calculating shipping for this address: {user_errors[0].get('message', 'Address validation failed')}"
             }
+        
+        if not updated_cart:
+            return {
+                "status": "error",
+                "error_message": "I couldn't update the cart with your address. Please try again!"
+            }
+        
+        # Extract delivery options/shipping rates
+        delivery_groups = updated_cart.get("deliveryGroups", {}).get("edges", [])
+        shipping_options = []
+        
+        for group_edge in delivery_groups:
+            group = group_edge.get("node", {})
+            delivery_options = group.get("deliveryOptions", [])
+            
+            for option in delivery_options:
+                estimated_cost = option.get("estimatedCost", {})
+                if estimated_cost:
+                    shipping_options.append({
+                        "title": option.get("title", "Standard Shipping"),
+                        "description": option.get("description", ""),
+                        "handle": option.get("handle", ""),
+                        "cost": estimated_cost
+                    })
+        
+        # If no delivery options available, try to get cost from cart totals
+        cart_cost = updated_cart.get("cost", {})
+        
+        if not shipping_options and cart_cost:
+            # Estimate shipping based on total vs subtotal difference
+            total = float(cart_cost.get("totalAmount", {}).get("amount", 0))
+            subtotal = float(cart_cost.get("subtotalAmount", {}).get("amount", 0))
+            tax = float(cart_cost.get("totalTaxAmount", {}).get("amount", 0))
+            
+            estimated_shipping = total - subtotal - tax
+            if estimated_shipping > 0:
+                currency = cart_cost.get("totalAmount", {}).get("currencyCode", "USD")
+                shipping_options.append({
+                    "title": "Standard Shipping",
+                    "description": "Estimated shipping cost",
+                    "handle": "standard",
+                    "cost": {
+                        "amount": str(estimated_shipping),
+                        "currencyCode": currency
+                    }
+                })
         
         return {
             "status": "success",
-            "shipping_estimate": cart.get("cost", {}),
-            "shipping_address": cart.get("shippingAddress", {}),
-            "cart_data": cart
+            "shipping_options": shipping_options,
+            "cart_totals": cart_cost,
+            "address": address,
+            "checkout_url": updated_cart.get("checkoutUrl")
         }
     
-    return result
+    # Handle API call failures
+    error_msg = result.get("error_message", "Unknown error occurred")
+    return {
+        "status": "error",
+        "error_message": f"I'm having trouble calculating shipping rates right now. Please try again in a moment! ({error_msg})"
+    }
 
 
 def apply_discount_code(
@@ -949,6 +1120,40 @@ def apply_discount_code(
     Returns:
         Dict[str, Any]: Cart with applied discounts
     """
+    # Input validation
+    if not cart_id or not isinstance(cart_id, str):
+        return {
+            "status": "error",
+            "error_message": "I need a valid cart to apply discount codes. Please add some items to your cart first."
+        }
+    
+    if not discount_codes or not isinstance(discount_codes, list):
+        return {
+            "status": "error",
+            "error_message": "Please provide a discount code to apply."
+        }
+    
+    # Clean and validate discount codes
+    valid_codes = []
+    for code in discount_codes:
+        if isinstance(code, str) and code.strip():
+            cleaned_code = code.strip().upper()
+            if len(cleaned_code) <= 50:  # Reasonable limit
+                valid_codes.append(cleaned_code)
+    
+    if not valid_codes:
+        return {
+            "status": "error",
+            "error_message": "Please provide valid discount codes (letters and numbers only)."
+        }
+    
+    # Check if cart exists first
+    cart_check = get_cart(cart_id, shop, api_version, access_token)
+    if cart_check["status"] != "success":
+        return {
+            "status": "error",
+            "error_message": "I couldn't find your cart. Please add some items first, then I can apply discount codes."
+        }
     query = """
     mutation cartDiscountCodesUpdate($cartId: ID!, $discountCodes: [String!]) {
         cartDiscountCodesUpdate(cartId: $cartId, discountCodes: $discountCodes) {
@@ -1017,7 +1222,7 @@ def apply_discount_code(
     
     variables = {
         "cartId": cart_id,
-        "discountCodes": discount_codes
+        "discountCodes": valid_codes
     }
     
     result = fetch_shopify_storefront_graphql(query, variables, shop, api_version, access_token)
@@ -1028,18 +1233,48 @@ def apply_discount_code(
         user_errors = cart_data.get("userErrors", [])
         
         if user_errors:
+            # Provide specific feedback for common discount code errors
+            error_msg = user_errors[0].get("message", "Invalid discount code")
+            if "not found" in error_msg.lower() or "invalid" in error_msg.lower():
+                return {
+                    "status": "error",
+                    "error_message": f"The discount code '{valid_codes[0]}' isn't valid. Please check the code and try again!"
+                }
+            elif "expired" in error_msg.lower():
+                return {
+                    "status": "error", 
+                    "error_message": f"The discount code '{valid_codes[0]}' has expired. Do you have another code to try?"
+                }
+            elif "minimum" in error_msg.lower():
+                return {
+                    "status": "error",
+                    "error_message": f"Your cart doesn't meet the minimum requirements for the discount code '{valid_codes[0]}'. Add more items to qualify!"
+                }
+            else:
+                return {
+                    "status": "error",
+                    "error_message": f"I couldn't apply the discount code '{valid_codes[0]}': {error_msg}"
+                }
+        
+        # Check if discounts were actually applied
+        discount_codes = cart.get("discountCodes", [])
+        applied_codes = [dc for dc in discount_codes if dc.get("applicable", False)]
+        
+        if not applied_codes and valid_codes:
             return {
-                "status": "error",
-                "error_message": f"Discount application errors: {user_errors}"
+                "status": "error", 
+                "error_message": f"The discount code '{valid_codes[0]}' couldn't be applied to your current cart items."
             }
         
         return {
             "status": "success",
             "cart_id": cart.get("id"),
             "checkout_url": cart.get("checkoutUrl"),
-            "discount_codes": cart.get("discountCodes", []),
+            "discount_codes": discount_codes,
             "discount_allocations": cart.get("discountAllocations", []),
-            "cart_data": cart
+            "applied_codes": applied_codes,
+            "cart_data": cart,
+            "message": f"✅ Applied discount code '{applied_codes[0].get('code')}' to your cart!" if applied_codes else "Discount codes updated"
         }
     
     return result

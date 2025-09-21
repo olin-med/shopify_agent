@@ -69,12 +69,6 @@ Your Shopify agent now has **complete e-commerce capabilities** and can handle t
 12. `get_subscription_products()` - Find subscription-enabled products
 13. `explain_subscription_options()` - Detailed subscription explanations
 
-**WhatsApp Formatting Tools:**
-14. `create_product_showcase()` - Format products for mobile
-15. `create_cart_summary()` - Format cart contents
-16. `create_whatsapp_buttons()` - Interactive message buttons
-17. `create_greeting_message()` - Welcome messages
-18. `format_checkout_message()` - Checkout completion messages
 
 ### **Enhanced Agent Capabilities**
 - **Complete Shopping Workflow** - From discovery to checkout
