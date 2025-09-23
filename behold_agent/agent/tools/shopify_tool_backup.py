@@ -17,7 +17,7 @@ def validate_graphql_with_mcp(query: str, api: str = "admin", version: str = "20
         query (str): The GraphQL query to validate
         api (str): The API to validate against (default: "admin")
         version (str): The API version to validate against
-    
+
     Returns:
         Dict[str, Any]: Validation result with status and details
     """

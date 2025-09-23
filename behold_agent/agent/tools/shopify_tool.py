@@ -435,29 +435,33 @@ def build_dynamic_query(intent: str, parameters: Dict[str, Any], api: str = "sto
 
 
 def execute_shopify_operation(
-    intent: str, 
+    intent: str,
     parameters: Dict[str, Any],
-    api: str = "storefront"
+    api: str
 ) -> Dict[str, Any]:
     """
     Unified function to execute any Shopify operation using MCP-powered query building.
-    
+
     Args:
         intent: User intent (e.g., "search products", "create cart", "get shipping rates")
         parameters: Operation parameters
         api: Target API ("admin" or "storefront")
-    
+
     Returns:
         Operation result with user-friendly error handling
     """
     try:
+        # Set default API if not provided
+        if not api:
+            api = "storefront"
+
         # Input validation
         if not intent or not isinstance(intent, str):
             return {
                 "status": "error",
                 "error_message": "Please specify what you'd like to do (e.g., 'search products', 'create cart')"
             }
-        
+
         if not isinstance(parameters, dict):
             parameters = {}
         
@@ -949,18 +953,32 @@ def _execute_apply_discount(cart_id: str, codes: List[str]) -> Dict[str, Any]:
 
 
 def _execute_shipping_calculation(cart_id: str, address: Dict[str, str]) -> Dict[str, Any]:
-    """Fallback shipping calculation using buyer identity approach."""
+    """Modern shipping calculation using the 2025-01 CartDelivery API."""
     if not cart_id or not address.get("country"):
         return {
             "status": "error",
             "error_message": "Please provide cart ID and shipping address with at least a country."
         }
 
-    # Use cartBuyerIdentityUpdate to set delivery address preferences
-    # This triggers shipping calculation in modern Shopify
+    # Step 1: Update buyer identity with country code
     buyer_identity_query = """
     mutation cartBuyerIdentityUpdate($cartId: ID!, $buyerIdentity: CartBuyerIdentityInput!) {
         cartBuyerIdentityUpdate(cartId: $cartId, buyerIdentity: $buyerIdentity) {
+            cart {
+                id
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+
+    # Step 2: Add delivery address using correct 2025-01 format
+    add_delivery_address_query = """
+    mutation cartDeliveryAddressesAdd($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
+        cartDeliveryAddressesAdd(cartId: $cartId, addresses: $addresses) {
             cart {
                 id
                 deliveryGroups(first: 5) {
@@ -971,6 +989,14 @@ def _execute_shipping_calculation(cart_id: str, address: Dict[str, str]) -> Dict
                                 handle
                                 title
                                 description
+                                estimatedCost {
+                                    amount
+                                    currencyCode
+                                }
+                            }
+                            selectedDeliveryOption {
+                                handle
+                                title
                                 estimatedCost {
                                     amount
                                     currencyCode
@@ -996,6 +1022,9 @@ def _execute_shipping_calculation(cart_id: str, address: Dict[str, str]) -> Dict
             }
             userErrors {
                 field
+                message
+            }
+            warnings {
                 message
             }
         }
@@ -1029,379 +1058,190 @@ def _execute_shipping_calculation(cart_id: str, address: Dict[str, str]) -> Dict
         }
 
         country_upper = country_input.upper().strip()
-
-        # Return mapped value if exists, otherwise assume it's already a valid code
         return country_map.get(country_upper, country_upper)
 
     # Normalize the country code
     normalized_country = normalize_country_code(address.get("country", "US"))
 
-    # Create buyer identity with delivery preferences
-    buyer_identity = {
-        "countryCode": normalized_country,
-        "deliveryAddressPreferences": [{
-            "country": normalized_country,
-            "province": address.get("province", address.get("state", "")),
-            "city": address.get("city", ""),
-            "zip": address.get("zip", address.get("postal_code", address.get("zipcode", "")))
-        }]
-    }
-    
-    variables = {
-        "cartId": cart_id,
-        "buyerIdentity": buyer_identity
-    }
-    
-    result = execute_shopify_graphql(buyer_identity_query, variables, "storefront")
+    try:
+        # Step 1: Update buyer identity with country code only
+        buyer_identity = {
+            "countryCode": normalized_country
+        }
 
-    if result["status"] == "success":
-        shipping_data = result["data"].get("cartBuyerIdentityUpdate", {})
-        user_errors = shipping_data.get("userErrors", [])
+        variables = {
+            "cartId": cart_id,
+            "buyerIdentity": buyer_identity
+        }
+
+        result = execute_shopify_graphql(buyer_identity_query, variables, "storefront")
+
+        if result["status"] != "success":
+            return {
+                "status": "error",
+                "error_message": f"Failed to update buyer identity: {result.get('error_message', 'Unknown error')}"
+            }
+
+        # Check for user errors in buyer identity update
+        buyer_data = result["data"].get("cartBuyerIdentityUpdate", {})
+        user_errors = buyer_data.get("userErrors", [])
 
         if user_errors:
             error_details = user_errors[0]
-            error_message = error_details.get('message', 'Unknown error')
-            error_field = error_details.get('field', '')
+            return {
+                "status": "error",
+                "error_message": f"Buyer identity error: {error_details.get('message', 'Unknown error')}"
+            }
 
-            # Provide more helpful error messages for common issues
-            if 'country' in error_message.lower() or 'country' in error_field.lower():
-                return {
-                    "status": "error",
-                    "error_message": f"Invalid country code '{normalized_country}'. Please use a valid country (e.g., Brazil, BR, United States, US, etc.)"
-                }
-            elif 'address' in error_message.lower():
-                return {
-                    "status": "error",
-                    "error_message": f"Address format issue: {error_message}. Please provide at least country and city."
-                }
-            else:
-                return {
-                    "status": "error",
-                    "error_message": f"Shipping calculation failed: {error_message}"
-                }
-
-        cart = shipping_data.get("cart", {})
-        delivery_groups = cart.get("deliveryGroups", {}).get("edges", [])
-
-        # Extract shipping options
-        shipping_options = []
-        for group_edge in delivery_groups:
-            group = group_edge.get("node", {})
-            options = group.get("deliveryOptions", [])
-
-            for option in options:
-                estimated_cost = option.get("estimatedCost", {})
-                shipping_options.append({
-                    "handle": option.get("handle", ""),
-                    "title": option.get("title", "Standard Shipping"),
-                    "description": option.get("description", ""),
-                    "estimatedCost": estimated_cost
-                })
-
-        return {
-            "status": "success",
-            "shipping_options": shipping_options,
-            "total_options": len(shipping_options),
-            "cart_totals": cart.get("cost", {}),
-            "buyer_identity": buyer_identity,
-            "normalized_country": normalized_country  # For debugging
+        # Step 2: Create proper address structure for 2025-01 API
+        # Build CartDeliveryAddressInput format with correct field names
+        delivery_address = {
+            "countryCode": normalized_country  # Use countryCode, not country
         }
 
-    return {
-        "status": "error",
-        "error_message": f"Shipping calculation failed: {result.get('error_message', 'Unknown error')}. Country used: {normalized_country}"
-    }
+        # Add optional fields with correct field names
+        if address.get("city"):
+            delivery_address["city"] = address.get("city")
+
+        if address.get("province") or address.get("state"):
+            delivery_address["provinceCode"] = address.get("province", address.get("state", ""))  # Use provinceCode
+
+        if address.get("zip") or address.get("postal_code") or address.get("zipcode"):
+            delivery_address["zip"] = address.get("zip", address.get("postal_code", address.get("zipcode", "")))
+
+        if address.get("address1") or address.get("street"):
+            delivery_address["address1"] = address.get("address1", address.get("street", ""))
+
+        if address.get("address2") or address.get("street2"):
+            delivery_address["address2"] = address.get("address2", address.get("street2", ""))
+
+        if address.get("company"):
+            delivery_address["company"] = address.get("company")
+
+        if address.get("phone"):
+            delivery_address["phone"] = address.get("phone")
+
+        if address.get("firstName"):
+            delivery_address["firstName"] = address.get("firstName")
+
+        if address.get("lastName"):
+            delivery_address["lastName"] = address.get("lastName")
+
+        # Create CartSelectableAddressInput with proper structure
+        delivery_address_input = {
+            "address": {
+                "deliveryAddress": delivery_address
+            },
+            "selected": True,  # Mark as selected to trigger shipping calculation
+            "oneTimeUse": True  # Don't save to customer addresses
+        }
+
+        variables = {
+            "cartId": cart_id,
+            "addresses": [delivery_address_input]
+        }
+
+        result = execute_shopify_graphql(add_delivery_address_query, variables, "storefront")
+
+        if result["status"] == "success":
+            shipping_data = result["data"].get("cartDeliveryAddressesAdd", {})
+            user_errors = shipping_data.get("userErrors", [])
+
+            if user_errors:
+                error_details = user_errors[0]
+                error_message = error_details.get('message', 'Unknown error')
+                error_field = error_details.get('field', '')
+
+                # Provide more helpful error messages for common issues
+                if 'country' in error_message.lower() or 'country' in error_field.lower():
+                    return {
+                        "status": "error",
+                        "error_message": f"Invalid country code '{normalized_country}'. Please use a valid country (e.g., Brazil=BR, United States=US, etc.)"
+                    }
+                elif 'address' in error_message.lower():
+                    return {
+                        "status": "error",
+                        "error_message": f"Address format issue: {error_message}. Please provide at least country and city."
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "error_message": f"Shipping calculation failed: {error_message}"
+                    }
+
+            # Check for warnings (non-critical issues)
+            warnings = shipping_data.get("warnings", [])
+            warning_messages = [w.get("message", "") for w in warnings] if warnings else []
+
+            cart = shipping_data.get("cart", {})
+            delivery_groups = cart.get("deliveryGroups", {}).get("edges", [])
+
+            # Extract shipping options
+            shipping_options = []
+            for group_edge in delivery_groups:
+                group = group_edge.get("node", {})
+                options = group.get("deliveryOptions", [])
+
+                for option in options:
+                    estimated_cost = option.get("estimatedCost", {})
+                    shipping_options.append({
+                        "handle": option.get("handle", ""),
+                        "title": option.get("title", "Standard Shipping"),
+                        "description": option.get("description", ""),
+                        "estimatedCost": estimated_cost
+                    })
+
+            return {
+                "status": "success",
+                "shipping_options": shipping_options,
+                "total_options": len(shipping_options),
+                "cart_totals": cart.get("cost", {}),
+                "normalized_country": normalized_country,
+                "warnings": warning_messages,
+                "delivery_address_used": delivery_address  # For debugging
+            }
+
+        return {
+            "status": "error",
+            "error_message": f"Shipping calculation failed: {result.get('error_message', 'Unknown error')}. Country used: {normalized_country}"
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Unexpected error during shipping calculation: {str(e)}"
+        }
 
 
 # =============================================================================
-# PUBLIC API - User-facing functions that replace the old tools
+# EXPORTED API FUNCTIONS
 # =============================================================================
+# Only the essential functions are exported - all operations go through execute_shopify_operation
 
-def search_products(query: str, first: int = 20, **kwargs) -> Dict[str, Any]:
-    """
-    Search for products using natural language or specific terms.
-    
-    Args:
-        query: Search query (e.g., "shoes", "red dress", "electronics")
-        first: Maximum number of products to return
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with search results and metadata
-    """
-    result = execute_shopify_operation(
-        "search products",
-        {"query": query, "first": first}
-    )
-    
-    # Handle fallback result format (direct from _execute_product_search)
-    if result.get("status") == "success" and "products" in result and "data" not in result:
-        # This is a direct fallback result, wrap it properly
-        return {
-            "status": "success",
-            "intent": "search products",
-            "data": {
-                "products": result.get("products", []),
-                "total_found": result.get("total_found", 0),
-                "search_query": result.get("search_query", query)
-            },
-            "raw_data": result
-        }
-    
-    return result
-
-
-def create_cart(lines: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
-    """
-    Create a new shopping cart with specified items.
-    
-    Args:
-        lines: List of items with 'merchandiseId' and 'quantity'
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with cart ID, checkout URL, and cart details
-    """
-    result = execute_shopify_operation(
-        "create cart", 
-        {"lines": lines}
-    )
-    
-    # Handle fallback result format (direct from _execute_cart_creation)
-    if result.get("status") == "success" and "cart_id" in result and "data" not in result:
-        # This is a direct fallback result, wrap it properly
-        return {
-            "status": "success",
-            "intent": "create cart",
-            "data": {
-                "cart_id": result.get("cart_id"),
-                "checkout_url": result.get("checkout_url"),
-                "total_quantity": result.get("total_quantity", 0),
-                "cost": result.get("cost", {})
-            },
-            "raw_data": result
-        }
-    
-    return result
-
-
-def get_cart(cart_id: str, **kwargs) -> Dict[str, Any]:
-    """
-    Retrieve cart information by cart ID.
-    
-    Args:
-        cart_id: The cart ID to retrieve
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with cart contents and details
-    """
-    return execute_shopify_operation(
-        "get cart",
-        {"cart_id": cart_id}
-    )
-
-
-def modify_cart(cart_id: str, lines: List[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
-    """
-    Modify an existing cart by updating line items.
-    
-    Args:
-        cart_id: The cart ID to modify
-        lines: List of line updates with 'id', 'merchandiseId', 'quantity'
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with updated cart details
-    """
-    return execute_shopify_operation(
-        "modify cart",
-        {"cart_id": cart_id, "lines": lines}
-    )
-
-
-def apply_discount_code(cart_id: str, discount_codes: List[str], **kwargs) -> Dict[str, Any]:
-    """
-    Apply discount codes to a cart.
-    
-    Args:
-        cart_id: The cart ID to apply discounts to
-        discount_codes: List of discount codes
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with discount application results
-    """
-    return execute_shopify_operation(
-        "apply discount",
-        {"cart_id": cart_id, "codes": discount_codes}
-    )
-
-
-def calculate_shipping_estimate(cart_id: str, address: Dict[str, str], **kwargs) -> Dict[str, Any]:
-    """
-    Calculate shipping estimates for a cart to a specific address.
-    
-    Args:
-        cart_id: The cart ID
-        address: Address dictionary with 'country', 'province', 'city', 'zip'
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with shipping options and costs
-    """
-    return execute_shopify_operation(
-        "calculate shipping",
-        {"cart_id": cart_id, "address": address}
-    )
-
-
-def create_checkout(cart_id: str, **kwargs) -> Dict[str, Any]:
-    """
-    Create a checkout URL from an existing cart.
-    
-    Args:
-        cart_id: The cart ID to create checkout from
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with checkout URL and cart details
-    """
-    # This is essentially just getting the cart since checkout URL is included
-    cart_result = get_cart(cart_id, **kwargs)
-    
-    if cart_result.get("status") == "success" and "data" in cart_result:
-        cart_data = cart_result["data"]
-        checkout_url = cart_data.get("checkout_url") or cart_data.get("checkoutUrl")
-        
-        return {
-            "status": "success", 
-            "checkout_url": checkout_url,
-            "cart_data": cart_data
-        }
-    
-    # Handle error cases gracefully
-    if cart_result.get("status") == "error":
-        return cart_result
-    
-    # Fallback for unexpected structure
-    return {
-        "status": "error",
-        "error_message": "Unable to create checkout. Please ensure the cart exists and has items."
-    }
-
-
-def get_store_policies(**kwargs) -> Dict[str, Any]:
-    """
-    Retrieve store policies (shipping, return, privacy).
-    
-    Args:
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with store policies
-    """
-    return execute_shopify_operation(
-        "get store policies",
-        {},
-        api="storefront"
-    )
-
-
-def get_product_recommendations(product_id: str, recommendation_type: str = "related", 
-                               limit: int = 5, **kwargs) -> Dict[str, Any]:
-    """
-    Get product recommendations for upsell, cross-sell, or related products.
-    
-    Args:
-        product_id: The base product ID
-        recommendation_type: Type of recommendations ("related", "upsell", "crosssell")
-        limit: Number of recommendations to return
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with product recommendations
-    """
-    return execute_shopify_operation(
-        f"get {recommendation_type} product recommendations",
-        {"product_id": product_id, "limit": limit},
-        api="admin"
-    )
-
-
-def find_product_alternatives(product_id: str, reason: str = "out_of_stock", 
-                             limit: int = 5, **kwargs) -> Dict[str, Any]:
-    """
-    Find alternative products when the requested item is unavailable.
-    
-    Args:
-        product_id: The unavailable product ID
-        reason: Reason for finding alternatives
-        limit: Number of alternatives to return
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with product alternatives
-    """
-    return execute_shopify_operation(
-        "find product alternatives",
-        {"product_id": product_id, "reason": reason, "limit": limit},
-        api="admin"
-    )
-
-
-def get_subscription_products(limit: int = 20, **kwargs) -> Dict[str, Any]:
-    """
-    Get products that support subscriptions/recurring orders.
-    
-    Args:
-        limit: Number of products to return
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with subscription-enabled products
-    """
-    return execute_shopify_operation(
-        "get subscription products",
-        {"limit": limit},
-        api="admin"
-    )
-
-
-def explain_subscription_options(product_id: str, **kwargs) -> Dict[str, Any]:
-    """
-    Explain subscription options for a specific product.
-    
-    Args:
-        product_id: The product ID to explain subscriptions for
-        **kwargs: Additional parameters (ignored for compatibility)
-    
-    Returns:
-        Dict with subscription options explanation
-    """
-    return execute_shopify_operation(
-        "explain subscription options",
-        {"product_id": product_id},
-        api="admin"
-    )
-
-
-# Legacy compatibility functions (kept for backwards compatibility)
-def fetch_shopify_graphql(query: str, variables: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
+# Legacy compatibility functions (kept for agent tool compatibility)
+def fetch_shopify_graphql(query: str, variables: Optional[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
     """Legacy compatibility wrapper for direct GraphQL execution."""
+    if variables is None:
+        variables = {}
     return execute_shopify_graphql(query, variables, api="admin", **kwargs)
 
 
-def fetch_shopify_storefront_graphql(query: str, variables: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
+def fetch_shopify_storefront_graphql(query: str, variables: Optional[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
     """Legacy compatibility wrapper for direct GraphQL execution."""
+    if variables is None:
+        variables = {}
     return execute_shopify_graphql(query, variables, api="storefront", **kwargs)
 
 
-def validate_graphql_with_mcp(query: str, api: str = "admin", **kwargs) -> Dict[str, Any]:
+def validate_graphql_with_mcp(query: str, api: str, **kwargs) -> Dict[str, Any]:
     """Legacy compatibility wrapper for GraphQL validation."""
+    if not api:
+        api = "admin"
     return validate_graphql_query(query, api)
 
 
-def introspect_graphql_schema(search_term: str, api: str = "admin", **kwargs) -> Dict[str, Any]:
+def introspect_graphql_schema(search_term: str, api: str, **kwargs) -> Dict[str, Any]:
     """Legacy compatibility wrapper for schema introspection."""
+    if not api:
+        api = "admin"
     return introspect_shopify_schema(search_term, api)

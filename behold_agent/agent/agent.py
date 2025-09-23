@@ -5,18 +5,7 @@ from .tools import (
     validate_graphql_with_mcp, 
     introspect_graphql_schema,
     fetch_shopify_storefront_graphql,
-    create_cart,
-    modify_cart,
-    get_cart,
-    create_checkout,
-    get_store_policies,
-    search_products,
-    calculate_shipping_estimate,
-    apply_discount_code,
-    get_product_recommendations,
-    find_product_alternatives,
-    get_subscription_products,
-    explain_subscription_options,
+    execute_shopify_operation,
 )
 
 
@@ -30,24 +19,13 @@ root_agent = Agent(
     ),
     instruction=(BEHOLD_AGENT_PROMPT),
     tools=[
-        # Admin API tools
-        fetch_shopify_graphql, 
-        validate_graphql_with_mcp, 
+        # Core GraphQL tools
+        fetch_shopify_graphql,
+        fetch_shopify_storefront_graphql, 
+        validate_graphql_with_mcp,
         introspect_graphql_schema,
-        # Storefront API tools
-        fetch_shopify_storefront_graphql,
-        create_cart,
-        modify_cart,
-        get_cart,
-        create_checkout,
-        get_store_policies,
-        search_products,
-        calculate_shipping_estimate,
-        apply_discount_code,
-        # Intelligence tools
-        get_product_recommendations,
-        find_product_alternatives,
-        get_subscription_products,
-        explain_subscription_options
+        
+        # Universal operation tool
+        execute_shopify_operation
     ],
 )
