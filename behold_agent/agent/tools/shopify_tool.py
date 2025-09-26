@@ -1245,3 +1245,78 @@ def introspect_graphql_schema(search_term: str, api: str, **kwargs) -> Dict[str,
     if not api:
         api = "admin"
     return introspect_shopify_schema(search_term, api)
+
+
+def get_store_info() -> Dict[str, Any]:
+    """
+    Get basic store information including name and available product types.
+    This helps the agent understand what it's actually selling.
+    """
+    try:
+        # Query to get store info and product categories
+        store_query = """
+        query getStoreInfo {
+            shop {
+                name
+                description
+                url
+                primaryDomain {
+                    host
+                }
+            }
+            products(first: 100) {
+                edges {
+                    node {
+                        productType
+                        vendor
+                        tags
+                    }
+                }
+            }
+        }
+        """
+
+        result = execute_shopify_graphql(store_query, {}, "storefront")
+
+        if result["status"] == "success":
+            data = result["data"]
+            shop = data.get("shop", {})
+            products = data.get("products", {}).get("edges", [])
+
+            # Extract unique product types and categories
+            product_types = set()
+            vendors = set()
+            tags = set()
+
+            for edge in products:
+                node = edge.get("node", {})
+                if node.get("productType"):
+                    product_types.add(node["productType"])
+                if node.get("vendor"):
+                    vendors.add(node["vendor"])
+                if node.get("tags"):
+                    for tag in node["tags"]:
+                        tags.add(tag)
+
+            return {
+                "status": "success",
+                "name": shop.get("name", "Our Store"),
+                "description": shop.get("description", ""),
+                "url": shop.get("url", ""),
+                "domain": shop.get("primaryDomain", {}).get("host", ""),
+                "product_types": list(product_types),
+                "vendors": list(vendors),
+                "tags": list(tags),
+                "total_products": len(products)
+            }
+
+        return {
+            "status": "error",
+            "error_message": f"Failed to fetch store info: {result.get('error_message', 'Unknown error')}"
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Error getting store info: {str(e)}"
+        }

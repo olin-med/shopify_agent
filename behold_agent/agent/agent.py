@@ -1,11 +1,12 @@
 from google.adk.agents import Agent
 from .prompt import BEHOLD_AGENT_PROMPT
 from .tools import (
-    fetch_shopify_graphql, 
-    validate_graphql_with_mcp, 
+    fetch_shopify_graphql,
+    validate_graphql_with_mcp,
     introspect_graphql_schema,
     fetch_shopify_storefront_graphql,
     execute_shopify_operation,
+    get_store_info,
 )
 
 
@@ -21,11 +22,14 @@ root_agent = Agent(
     tools=[
         # Core GraphQL tools
         fetch_shopify_graphql,
-        fetch_shopify_storefront_graphql, 
+        fetch_shopify_storefront_graphql,
         validate_graphql_with_mcp,
         introspect_graphql_schema,
-        
+
         # Universal operation tool
-        execute_shopify_operation
+        execute_shopify_operation,
+
+        # Store discovery tool
+        get_store_info
     ],
 )
