@@ -3,11 +3,15 @@ import subprocess
 import json
 import requests
 import uuid
+import logging
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Configure logger for this module
+logger = logging.getLogger(__name__)
 
 # Global conversation state for MCP
 _mcp_conversation_id = None
@@ -22,66 +26,134 @@ class MCPError(Exception):
 def _run_mcp_command(request: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
     """
     Execute an MCP command and return parsed response.
-    
+
     Args:
         request: JSON-RPC request dictionary
         timeout: Command timeout in seconds
-    
+
     Returns:
         Dict containing the MCP response
-    
+
     Raises:
         MCPError: If MCP command fails
     """
     try:
         mcp_command = ["npx", "-y", "@shopify/dev-mcp@latest"]
-        
-        result = subprocess.run(
+
+        logger.debug(f"Running MCP command: {' '.join(mcp_command)}")
+        logger.debug(f"MCP request: {json.dumps(request, indent=2)}")
+
+        # Use Popen with communicate() for proper stdio handling
+        # MCP stdio protocol requires line-delimited JSON messages
+        proc = subprocess.Popen(
             mcp_command,
-            input=json.dumps(request),
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout
+            bufsize=1  # Line buffering for proper MCP stdio communication
         )
-        
-        if result.returncode != 0:
-            raise MCPError(f"MCP command failed: {result.stderr}")
-        
-        response = json.loads(result.stdout)
-        
+
+        try:
+            # Send JSON with newline (MCP expects line-delimited JSON-RPC)
+            stdout, stderr = proc.communicate(
+                input=json.dumps(request) + '\n',
+                timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            logger.error(f"MCP command timed out after {timeout}s")
+            raise MCPError("MCP command timed out")
+
+        if proc.returncode != 0:
+            logger.error(f"MCP command failed with return code {proc.returncode}")
+            logger.error(f"MCP stderr: {stderr}")
+            raise MCPError(f"MCP command failed: {stderr}")
+
+        # Check if stdout is empty
+        if not stdout or stdout.strip() == "":
+            logger.error("MCP returned empty response")
+            logger.error(f"MCP stderr: {stderr}")
+            raise MCPError("MCP returned empty response - the MCP service may not be responding correctly")
+
+        # Parse JSON from multi-line output (MCP may output debug logs + JSON)
+        # Try to find and parse the JSON-RPC response line
+        response = None
+        for line in stdout.strip().split('\n'):
+            line = line.strip()
+            # Skip debug/log lines (e.g., [shopify-dev-fetch] ...)
+            if not line or line.startswith('[') or not line.startswith('{'):
+                continue
+            try:
+                parsed = json.loads(line)
+                # Check if it's a valid JSON-RPC response
+                if 'jsonrpc' in parsed and 'id' in parsed:
+                    response = parsed
+                    break
+            except json.JSONDecodeError:
+                continue
+
+        if response is None:
+            logger.error(f"Failed to parse JSON from MCP output. Raw output: {stdout}")
+            raise MCPError("MCP returned invalid JSON response")
+
+        logger.debug(f"MCP response: {json.dumps(response, indent=2)}")
+
         if "error" in response:
+            logger.error(f"MCP returned error: {response['error']}")
             raise MCPError(f"MCP error: {response['error']}")
-        
+
         return response
-        
-    except subprocess.TimeoutExpired:
-        raise MCPError("MCP command timed out")
+
+    except MCPError:
+        # Re-raise MCPError as-is
+        raise
     except json.JSONDecodeError as e:
-        raise MCPError(f"Failed to parse MCP response: {e}")
+        logger.error(f"Failed to parse MCP response: {str(e)}")
+        raise MCPError(f"Failed to parse MCP response: {e}. MCP may not be available or is not responding correctly.")
     except Exception as e:
+        logger.error(f"Unexpected MCP error: {str(e)}", exc_info=True)
         raise MCPError(f"MCP command error: {str(e)}")
+
+
+def _normalize_api_for_mcp(api: str) -> str:
+    """
+    Normalize API parameter for MCP (which expects 'storefront-graphql' not 'storefront').
+
+    Args:
+        api: API name ("admin" or "storefront")
+
+    Returns:
+        MCP-compatible API name
+    """
+    if api == "storefront":
+        return "storefront-graphql"
+    return api
 
 
 def initialize_mcp_conversation(api: str = "admin") -> str:
     """
     Initialize MCP conversation for a specific API.
-    
+
     Args:
-        api: Shopify API to initialize ("admin", "storefront", etc.)
-    
+        api: Shopify API to initialize ("admin" or "storefront")
+
     Returns:
         Conversation ID for subsequent MCP calls
     """
     global _mcp_conversation_id, _mcp_api_contexts
-    
+
+    # Normalize API for MCP
+    mcp_api = _normalize_api_for_mcp(api)
+
     # Generate conversation ID if not exists
     if _mcp_conversation_id is None:
         _mcp_conversation_id = str(uuid.uuid4())
-    
+
     # Skip if this API context is already initialized
-    if api in _mcp_api_contexts:
+    if mcp_api in _mcp_api_contexts:
         return _mcp_conversation_id
-    
+
     try:
         request = {
             "jsonrpc": "2.0",
@@ -90,22 +162,22 @@ def initialize_mcp_conversation(api: str = "admin") -> str:
             "params": {
                 "name": "learn_shopify_api",
                 "arguments": {
-                    "api": api,
+                    "api": mcp_api,
                     "conversationId": _mcp_conversation_id
                 }
             }
         }
-        
+
         response = _run_mcp_command(request)
-        
+
         if response.get("result"):
-            _mcp_api_contexts[api] = True
+            _mcp_api_contexts[mcp_api] = True
             return _mcp_conversation_id
         else:
-            raise MCPError(f"Failed to initialize {api} API context")
-            
+            raise MCPError(f"Failed to initialize {mcp_api} API context")
+
     except Exception as e:
-        raise MCPError(f"Failed to initialize MCP conversation for {api}: {str(e)}")
+        raise MCPError(f"Failed to initialize MCP conversation for {mcp_api}: {str(e)}")
 
 
 def search_shopify_docs(query: str, api: str = "admin", max_results: int = 5) -> Dict[str, Any]:
@@ -151,44 +223,45 @@ def search_shopify_docs(query: str, api: str = "admin", max_results: int = 5) ->
         }
 
 
-def introspect_shopify_schema(search_term: str, api: str = "admin", 
+def introspect_shopify_schema(search_term: str, api: str = "admin",
                              filter_types: List[str] = ["all"]) -> Dict[str, Any]:
     """
     Introspect Shopify GraphQL schema using MCP.
-    
+
     Args:
         search_term: Term to search for in schema
-        api: API to introspect
+        api: API to introspect ("admin" or "storefront")
         filter_types: Types to filter (types, queries, mutations, all)
-    
+
     Returns:
         Schema introspection results
     """
     try:
         conversation_id = initialize_mcp_conversation(api)
-        
+        mcp_api = _normalize_api_for_mcp(api)
+
         request = {
             "jsonrpc": "2.0",
-            "id": 1, 
+            "id": 1,
             "method": "tools/call",
             "params": {
                 "name": "introspect_graphql_schema",
                 "arguments": {
                     "conversationId": conversation_id,
                     "query": search_term,
-                    "api": api,
+                    "api": mcp_api,
                     "filter": filter_types
                 }
             }
         }
-        
+
         response = _run_mcp_command(request)
         return {
             "status": "success",
             "schema": response.get("result", {}),
             "search_term": search_term
         }
-        
+
     except MCPError as e:
         return {
             "status": "error",
@@ -199,53 +272,54 @@ def introspect_shopify_schema(search_term: str, api: str = "admin",
 def validate_graphql_query(query: str, api: str = "admin") -> Dict[str, Any]:
     """
     Validate GraphQL query using MCP.
-    
+
     Args:
         query: GraphQL query to validate
-        api: API to validate against
-    
+        api: API to validate against ("admin" or "storefront")
+
     Returns:
         Validation results
     """
     try:
         conversation_id = initialize_mcp_conversation(api)
-        
+        mcp_api = _normalize_api_for_mcp(api)
+
         request = {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "tools/call", 
+            "method": "tools/call",
             "params": {
                 "name": "validate_graphql_codeblocks",
                 "arguments": {
                     "conversationId": conversation_id,
-                    "api": api,
+                    "api": mcp_api,
                     "codeblocks": [query]
                 }
             }
         }
-        
+
         response = _run_mcp_command(request)
         result = response.get("result", {})
-        
+
         if result and len(result.get("content", [])) > 0:
             validation = result["content"][0]
             is_valid = not validation.get("isError", True)
-            
+
             return {
                 "status": "success" if is_valid else "error",
                 "is_valid": is_valid,
                 "validation_details": validation,
                 "query": query
             }
-        
+
         return {
             "status": "error",
             "error_message": "No validation results returned"
         }
-        
+
     except MCPError as e:
         return {
-            "status": "error", 
+            "status": "error",
             "error_message": f"Query validation failed: {str(e)}"
         }
 
@@ -260,7 +334,7 @@ def execute_shopify_graphql(
 ) -> Dict[str, Any]:
     """
     Execute a validated GraphQL query against Shopify APIs.
-    
+
     Args:
         query: GraphQL query string
         variables: Query variables
@@ -268,14 +342,14 @@ def execute_shopify_graphql(
         shop: Shop name (from env if not provided)
         api_version: API version (from env if not provided)
         access_token: Access token (from env if not provided)
-    
+
     Returns:
         GraphQL response data
     """
     # Get environment variables
     shop = shop or os.getenv("SHOPIFY_STORE")
     api_version = api_version or os.getenv("SHOPIFY_API_VERSION", "2025-07")
-    
+
     if api == "admin":
         access_token = access_token or os.getenv("SHOPIFY_ADMIN_TOKEN")
         url = f"https://{shop}.myshopify.com/admin/api/{api_version}/graphql.json"
@@ -284,55 +358,67 @@ def execute_shopify_graphql(
             "X-Shopify-Access-Token": access_token
         }
     else:  # storefront
-        access_token = access_token or os.getenv("SHOPIFY_STOREFRONT_TOKEN")  
+        access_token = access_token or os.getenv("SHOPIFY_STOREFRONT_TOKEN")
         url = f"https://{shop}.myshopify.com/api/{api_version}/graphql.json"
         headers = {
             "Content-Type": "application/json",
             "X-Shopify-Storefront-Access-Token": access_token
         }
-    
+
     # Validate required parameters
     if not shop:
+        logger.error("SHOPIFY_STORE environment variable is not set")
         return {
             "status": "error",
             "error_message": "Shop name is required. Set SHOPIFY_STORE in .env file."
         }
-    
+
     if not access_token:
         token_env = "SHOPIFY_ADMIN_TOKEN" if api == "admin" else "SHOPIFY_STOREFRONT_TOKEN"
+        logger.error(f"{token_env} environment variable is not set")
         return {
             "status": "error",
             "error_message": f"Access token is required. Set {token_env} in .env file."
         }
-    
+
     payload = {"query": query}
     if variables:
         payload["variables"] = variables
-    
+
+    logger.debug(f"Executing {api} GraphQL query to: {url}")
+    logger.debug(f"Query: {query[:200]}...")  # Log first 200 chars
+
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=30)
         response.raise_for_status()
-        
+
         data = response.json()
-        
+
         if "errors" in data:
+            logger.error(f"GraphQL returned errors: {json.dumps(data['errors'], indent=2)}")
             return {
                 "status": "error",
                 "error_message": f"GraphQL errors: {data['errors']}"
             }
-        
+
+        logger.debug(f"GraphQL query successful. Response data keys: {list(data.get('data', {}).keys())}")
         return {
             "status": "success",
             "data": data.get("data", {}),
             "extensions": data.get("extensions", {})
         }
-        
+
     except requests.exceptions.RequestException as e:
+        logger.error(f"GraphQL request failed: {str(e)}", exc_info=True)
+        if hasattr(e, 'response') and e.response is not None:
+            logger.error(f"Response status: {e.response.status_code}")
+            logger.error(f"Response body: {e.response.text}")
         return {
             "status": "error",
             "error_message": f"Request failed: {str(e)}"
         }
     except Exception as e:
+        logger.error(f"Unexpected error in GraphQL execution: {str(e)}", exc_info=True)
         return {
             "status": "error",
             "error_message": f"Unexpected error: {str(e)}"
@@ -1253,13 +1339,14 @@ def get_store_info() -> Dict[str, Any]:
     This helps the agent understand what it's actually selling.
     """
     try:
+        logger.info("Fetching store information...")
+
         # Query to get store info and product categories
         store_query = """
         query getStoreInfo {
             shop {
                 name
                 description
-                url
                 primaryDomain {
                     host
                 }
@@ -1298,11 +1385,10 @@ def get_store_info() -> Dict[str, Any]:
                     for tag in node["tags"]:
                         tags.add(tag)
 
-            return {
+            store_info = {
                 "status": "success",
                 "name": shop.get("name", "Our Store"),
                 "description": shop.get("description", ""),
-                "url": shop.get("url", ""),
                 "domain": shop.get("primaryDomain", {}).get("host", ""),
                 "product_types": list(product_types),
                 "vendors": list(vendors),
@@ -1310,12 +1396,17 @@ def get_store_info() -> Dict[str, Any]:
                 "total_products": len(products)
             }
 
+            logger.info(f"Store info fetched successfully: {shop.get('name')} with {len(products)} products")
+            return store_info
+
+        logger.error(f"Failed to fetch store info: {result.get('error_message')}")
         return {
             "status": "error",
             "error_message": f"Failed to fetch store info: {result.get('error_message', 'Unknown error')}"
         }
 
     except Exception as e:
+        logger.error(f"Error getting store info: {str(e)}", exc_info=True)
         return {
             "status": "error",
             "error_message": f"Error getting store info: {str(e)}"

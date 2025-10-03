@@ -7,11 +7,16 @@ from .tools import (
     fetch_shopify_storefront_graphql,
     execute_shopify_operation,
     get_store_info,
+    send_whatsapp_message,
+    get_whatsapp_client_info,
+    check_whatsapp_status,
+    get_whatsapp_qr_info,
+    start_whatsapp_bridge,
 )
 
 
 root_agent = Agent(
-    model="gemini-2.0-flash",
+    model="gemini-2.5-flash",
     name="behold_agent",
     description=(
         "Intelligent Shopify sales assistant that proactively helps customers by automatically accessing store data "
@@ -30,6 +35,13 @@ root_agent = Agent(
         execute_shopify_operation,
 
         # Store discovery tool
-        get_store_info
+        get_store_info,
+
+        # WhatsApp communication tools
+        send_whatsapp_message,
+        get_whatsapp_client_info,
+        check_whatsapp_status,
+        get_whatsapp_qr_info,
+        start_whatsapp_bridge,
     ],
 )
