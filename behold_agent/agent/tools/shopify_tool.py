@@ -108,6 +108,10 @@ def _run_mcp_command(request: Dict[str, Any], timeout: int = 30) -> Dict[str, An
     except MCPError:
         # Re-raise MCPError as-is
         raise
+    except FileNotFoundError as e:
+        # npx not found - likely Node.js not installed or not in PATH
+        logger.warning(f"npx command not found. Node.js may not be installed or not in PATH. Falling back to hardcoded queries.")
+        raise MCPError("MCP unavailable: npx command not found (Node.js required). Using fallback queries.")
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse MCP response: {str(e)}")
         raise MCPError(f"Failed to parse MCP response: {e}. MCP may not be available or is not responding correctly.")
