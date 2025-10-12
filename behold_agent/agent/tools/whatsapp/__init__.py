@@ -4,6 +4,7 @@ WhatsApp integration tools for Behold Shopify Agent.
 
 from .whatsapp_tool import (
     send_whatsapp_message,
+    send_whatsapp_image,
     get_whatsapp_client_info,
     check_whatsapp_status,
     get_whatsapp_qr_info,
@@ -22,6 +23,7 @@ from .webhook_handler import (
 __all__ = [
     # Core WhatsApp tools
     "send_whatsapp_message",
+    "send_whatsapp_image",
     "get_whatsapp_client_info",
     "check_whatsapp_status",
     "get_whatsapp_qr_info",

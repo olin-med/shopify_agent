@@ -596,27 +596,35 @@ def _fallback_operation(intent: str, parameters: Dict[str, Any], api: str) -> Di
     Fallback to hardcoded queries for common operations when MCP fails.
     """
     intent_lower = intent.lower()
-    
+
     # Product search fallback
     if "search" in intent_lower and "product" in intent_lower:
         return _execute_product_search(parameters.get("query", ""), parameters.get("first", 20))
-    
+
     # Cart creation fallback
     elif "create" in intent_lower and "cart" in intent_lower:
         return _execute_cart_creation(parameters.get("lines", []))
-    
+
+    # Add to cart fallback (CRITICAL: Check this BEFORE "get cart" since both contain "cart")
+    elif "add" in intent_lower and "cart" in intent_lower:
+        return _execute_add_to_cart(parameters.get("cart_id", ""), parameters.get("lines", []))
+
     # Get cart fallback
     elif "get" in intent_lower and "cart" in intent_lower:
         return _execute_get_cart(parameters.get("cart_id", ""))
-    
+
+    # Modify cart fallback
+    elif "modify" in intent_lower and "cart" in intent_lower:
+        return _execute_modify_cart(parameters.get("cart_id", ""), parameters.get("lines", []))
+
     # Apply discount fallback
     elif "discount" in intent_lower or "coupon" in intent_lower:
         return _execute_apply_discount(parameters.get("cart_id", ""), parameters.get("codes", []))
-    
+
     # Shipping calculation fallback
     elif "shipping" in intent_lower or "delivery" in intent_lower:
         return _execute_shipping_calculation(parameters.get("cart_id", ""), parameters.get("address", {}))
-    
+
     else:
         return {
             "status": "error",
@@ -629,25 +637,62 @@ def _format_operation_result(intent: str, data: Dict[str, Any], parameters: Dict
     Format GraphQL response data into user-friendly format based on operation intent.
     """
     intent_lower = intent.lower()
-    
+
     # Format product search results
     if "search" in intent_lower and "product" in intent_lower:
         # Handle both GraphQL format (edges) and direct array format
         if "edges" in data.get("products", {}):
             # Raw GraphQL format
             products = data.get("products", {}).get("edges", [])
+            formatted_products = []
+
+            for edge in products:
+                node = edge["node"]
+                # Extract image URL if available
+                image_url = None
+                images = node.get("images", {}).get("edges", [])
+                if images:
+                    image_url = images[0].get("node", {}).get("url")
+
+                # Create formatted product with image metadata
+                formatted_product = {
+                    **node,
+                    "primary_image_url": image_url,
+                    "has_image": bool(image_url)
+                }
+                formatted_products.append(formatted_product)
+
             return {
-                "products": [edge["node"] for edge in products],
+                "products": formatted_products,
                 "total_found": len(products),
-                "search_query": parameters.get("query", "")
+                "search_query": parameters.get("query", ""),
+                "has_images": any(p.get("has_image") for p in formatted_products)
             }
         else:
             # Direct array format from fallback
             products = data.get("products", [])
+            formatted_products = []
+
+            for product in products:
+                # Extract image URL if available
+                image_url = None
+                images = product.get("images", {}).get("edges", [])
+                if images:
+                    image_url = images[0].get("node", {}).get("url")
+
+                # Create formatted product with image metadata
+                formatted_product = {
+                    **product,
+                    "primary_image_url": image_url,
+                    "has_image": bool(image_url)
+                }
+                formatted_products.append(formatted_product)
+
             return {
-                "products": products,
+                "products": formatted_products,
                 "total_found": len(products),
-                "search_query": parameters.get("query", "")
+                "search_query": parameters.get("query", ""),
+                "has_images": any(p.get("has_image") for p in formatted_products)
             }
     
     # Format cart operations
@@ -660,11 +705,29 @@ def _format_operation_result(intent: str, data: Dict[str, Any], parameters: Dict
                 "total_quantity": len(cart_data.get("lines", {}).get("edges", [])),
                 "cost": cart_data.get("cost", {})
             }
+        elif "cartLinesAdd" in data:
+            cart_data = data["cartLinesAdd"]["cart"]
+            return {
+                "cart_id": cart_data.get("id"),
+                "checkout_url": cart_data.get("checkoutUrl"),
+                "lines": cart_data.get("lines", {}).get("edges", []),
+                "cost": cart_data.get("cost", {}),
+                "operation": "add"
+            }
+        elif "cartLinesUpdate" in data:
+            cart_data = data["cartLinesUpdate"]["cart"]
+            return {
+                "cart_id": cart_data.get("id"),
+                "checkout_url": cart_data.get("checkoutUrl"),
+                "lines": cart_data.get("lines", {}).get("edges", []),
+                "cost": cart_data.get("cost", {}),
+                "operation": "modify"
+            }
         elif "cart" in data:
             cart_data = data["cart"]
             return {
                 "cart_id": cart_data.get("id"),
-                "checkout_url": cart_data.get("checkoutUrl"), 
+                "checkout_url": cart_data.get("checkoutUrl"),
                 "lines": cart_data.get("lines", {}).get("edges", []),
                 "cost": cart_data.get("cost", {})
             }
@@ -980,6 +1043,176 @@ def _execute_get_cart(cart_id: str) -> Dict[str, Any]:
     
     return result
 
+def _execute_add_to_cart(cart_id: str, lines: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Add NEW items to an existing cart using cartLinesAdd.
+    CRITICAL: This is DIFFERENT from cartLinesUpdate - this adds new products!
+    """
+    if not cart_id:
+        return {
+            "status": "error",
+            "error_message": "Please provide a cart ID to add items to."
+        }
+
+    if not lines:
+        return {
+            "status": "error",
+            "error_message": "Please provide items to add to the cart."
+        }
+
+    graphql_query = """
+    mutation cartLinesAdd($cartId: ID!, $lines: [CartLineInput!]!) {
+        cartLinesAdd(cartId: $cartId, lines: $lines) {
+            cart {
+                id
+                checkoutUrl
+                lines(first: 50) {
+                    edges {
+                        node {
+                            id
+                            quantity
+                            merchandise {
+                                ... on ProductVariant {
+                                    id
+                                    title
+                                    price {
+                                        amount
+                                        currencyCode
+                                    }
+                                    product {
+                                        title
+                                        handle
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                cost {
+                    totalAmount {
+                        amount
+                        currencyCode
+                    }
+                    subtotalAmount {
+                        amount
+                        currencyCode
+                    }
+                }
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+
+    variables = {"cartId": cart_id, "lines": lines}
+    result = execute_shopify_graphql(graphql_query, variables, "storefront")
+
+    if result["status"] == "success":
+        cart_data = result["data"].get("cartLinesAdd", {})
+        if cart_data.get("userErrors"):
+            return {
+                "status": "error",
+                "error_message": f"Adding to cart failed: {cart_data['userErrors'][0].get('message')}"
+            }
+
+        cart = cart_data.get("cart", {})
+        return {
+            "status": "success",
+            "cart_id": cart.get("id"),
+            "checkout_url": cart.get("checkoutUrl"),
+            "lines": cart.get("lines", {}).get("edges", []),
+            "cost": cart.get("cost", {}),
+            "operation": "add"
+        }
+
+    return result
+
+
+def _execute_modify_cart(cart_id: str, lines: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Fallback cart modification with hardcoded query."""
+    if not cart_id:
+        return {
+            "status": "error",
+            "error_message": "Please provide a cart ID."
+        }
+    
+    if not lines:
+        return {
+            "status": "error",
+            "error_message": "Please provide line items to update."
+        }
+    
+    graphql_query = """
+    mutation cartLinesUpdate($cartId: ID!, $lines: [CartLineUpdateInput!]!) {
+        cartLinesUpdate(cartId: $cartId, lines: $lines) {
+            cart {
+                id
+                checkoutUrl
+                lines(first: 50) {
+                    edges {
+                        node {
+                            id
+                            quantity
+                            merchandise {
+                                ... on ProductVariant {
+                                    id
+                                    title
+                                    price {
+                                        amount
+                                        currencyCode
+                                    }
+                                    product {
+                                        title
+                                        handle
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                cost {
+                    totalAmount {
+                        amount
+                        currencyCode
+                    }
+                    subtotalAmount {
+                        amount
+                        currencyCode
+                    }
+                }
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+    
+    variables = {"cartId": cart_id, "lines": lines}
+    result = execute_shopify_graphql(graphql_query, variables, "storefront")
+    
+    if result["status"] == "success":
+        cart_data = result["data"].get("cartLinesUpdate", {})
+        if cart_data.get("userErrors"):
+            return {
+                "status": "error",
+                "error_message": f"Cart modification failed: {cart_data['userErrors'][0].get('message')}"
+            }
+        
+        cart = cart_data.get("cart", {})
+        return {
+            "status": "success",
+            "cart_id": cart.get("id"),
+            "checkout_url": cart.get("checkoutUrl"),
+            "lines": cart.get("lines", {}).get("edges", []),
+            "cost": cart.get("cost", {})
+        }
+    
+    return result
 
 def _execute_apply_discount(cart_id: str, codes: List[str]) -> Dict[str, Any]:
     """Fallback discount application with hardcoded query."""

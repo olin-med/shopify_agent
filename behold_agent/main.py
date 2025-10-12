@@ -239,22 +239,37 @@ def create_application() -> FastAPI:
                         except Exception as create_error:
                             logger.debug(f"Session already exists for {user_id}: {create_error}")
 
-                    # Inject context summary into the message if available
-                    enhanced_message = message
+                    # Inject user WhatsApp ID and context summary into the message
+                    # The agent needs to know the user's WhatsApp ID for sending images
+                    enhanced_message = f"[USER WHATSAPP ID: {user_id}]\n\n"
+
                     if context_summary:
                         # Prepend context to user message (invisible to user, visible to agent)
-                        enhanced_message = f"[CONTEXT FROM PREVIOUS TURNS]\n{context_summary}\n\n[CURRENT USER MESSAGE]\n{message}"
+                        enhanced_message += f"[CONTEXT FROM PREVIOUS TURNS]\n{context_summary}\n\n"
+
+                    enhanced_message += f"[CURRENT USER MESSAGE]\n{message}"
 
                     # Create user message content
                     user_message = Content(role="user", parts=[Part.from_text(text=enhanced_message)])
 
                     # Run agent asynchronously via Runner
                     response_text = ""
+                    whatsapp_tool_used = False
+
                     async for event in runner.run_async(
                         user_id=user_id,
                         session_id=session_id,
                         new_message=user_message
                     ):
+                        # Check if WhatsApp tools were used
+                        if hasattr(event, 'content') and event.content:
+                            for part in event.content.parts:
+                                if hasattr(part, 'function_call') and part.function_call:
+                                    func_name = part.function_call.name
+                                    if func_name in ['send_whatsapp_message', 'send_whatsapp_image']:
+                                        whatsapp_tool_used = True
+                                        logger.info(f"Detected WhatsApp tool usage: {func_name}")
+
                         if event.is_final_response():
                             response_text = event.content.parts[0].text
                             break
@@ -268,11 +283,12 @@ def create_application() -> FastAPI:
                         assistant_response=response_text,
                         metadata={
                             "user": {"message_id": message_id},
-                            "assistant": {}
+                            "assistant": {"whatsapp_tool_used": whatsapp_tool_used}
                         }
                     )
 
                     logger.info(f"Agent response: {response_text}")
+                    logger.info(f"WhatsApp tools used: {whatsapp_tool_used}")
                     logger.info(f"Context updated: {len(context.conversation_history)} messages in history")
 
                 except Exception as agent_error:
@@ -282,7 +298,14 @@ def create_application() -> FastAPI:
                 logger.error("Agent not available")
                 raise HTTPException(status_code=500, detail="Agent not available")
 
-            return {"reply": response_text}
+            # If agent used WhatsApp tools, it already sent the message
+            # If not, return the response so the bridge can send it
+            if whatsapp_tool_used:
+                logger.info("Agent used WhatsApp tools - no need to send response again")
+                return {"status": "success", "message": "Agent sent messages directly via WhatsApp tools"}
+            else:
+                logger.info("Agent did not use WhatsApp tools - returning response for bridge to send")
+                return {"reply": response_text}
 
         except Exception as e:
             logger.error(f"Error processing WhatsApp message: {e}")
