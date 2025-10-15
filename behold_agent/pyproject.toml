@@ -1,7 +1,7 @@
 [project]
 name = "behold-agent"
-version = "0.1.0"
-description = "WhatsApp Shopify agent with Google ADK integration"
+version = "0.2.0"
+description = "WhatsApp Shopify agent with Google ADK integration and Business Intelligence"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,6 +11,8 @@ dependencies = [
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "redis>=5.0.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.9",
 ]
 
 [project.optional-dependencies]
