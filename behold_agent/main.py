@@ -10,6 +10,7 @@ from typing import Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 # Configure logging first
@@ -22,6 +23,19 @@ logger = logging.getLogger(__name__)
 
 # Reduce verbosity of ADK model registry logs
 logging.getLogger('google_adk.google.adk.models.registry').setLevel(logging.WARNING)
+
+# Import analytics system
+try:
+    from analytics import analytics_router, webhooks_router, db_manager, tracking_service
+    analytics_available = True
+    logger.info("✅ Analytics system loaded successfully")
+except ImportError as e:
+    logger.warning(f"⚠️ Analytics system not available: {e}")
+    analytics_router = None
+    webhooks_router = None
+    db_manager = None
+    tracking_service = None
+    analytics_available = False
 
 # Import agent conditionally - use when available, fallback when not
 try:
@@ -89,6 +103,16 @@ except ImportError as e:
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     logger.info("Starting Behold WhatsApp Shopify Agent")
+
+    # Initialize database if analytics available
+    if analytics_available and db_manager:
+        try:
+            logger.info("Creating database tables...")
+            db_manager.create_tables()
+            logger.info("Database initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+
     yield
     logger.info("Shutting down Behold WhatsApp Shopify Agent")
 
@@ -97,14 +121,49 @@ def create_application() -> FastAPI:
     """Create FastAPI application with all components."""
     app = FastAPI(
         title="Behold WhatsApp Shopify Agent",
-        description="WhatsApp integration for Shopify store assistance using Google ADK",
-        version="1.0.0"
+        description="WhatsApp integration for Shopify store assistance using Google ADK with Business Intelligence",
+        version="0.2.0",
+        lifespan=lifespan
     )
-    
+
+    # Add CORS middleware for dashboard access
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Configure appropriately for production
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Include analytics and webhook routers if available
+    if analytics_available:
+        if analytics_router:
+            app.include_router(analytics_router)
+            logger.info("✅ Analytics routes enabled")
+        if webhooks_router:
+            app.include_router(webhooks_router)
+            logger.info("✅ Webhook routes enabled")
+
     @app.get("/")
     async def root():
         """Root endpoint."""
-        return {"message": "Behold WhatsApp Shopify Agent is running"}
+        return {
+            "message": "Behold WhatsApp Shopify Agent is running",
+            "version": "0.2.0",
+            "features": [
+                "WhatsApp Sales Agent",
+                "Business Intelligence & Analytics" if analytics_available else "Business Intelligence (Not Available)",
+                "Order Attribution & Tracking" if analytics_available else "Order Attribution (Not Available)",
+                "Shopify Integration"
+            ],
+            "endpoints": {
+                "health": "/health",
+                "process_message": "/process-whatsapp-message",
+                "analytics": "/analytics/overview" if analytics_available else None,
+                "webhooks": "/webhooks/shopify/orders/create" if analytics_available else None,
+                "docs": "/docs"
+            }
+        }
     
     @app.get("/health")
     async def health_check():
@@ -203,6 +262,15 @@ def create_application() -> FastAPI:
                     # Get or create session for this user
                     session_id = f"whatsapp_{user_id}"
 
+                    # Track user and conversation in database
+                    if tracking_service:
+                        try:
+                            tracking_service.get_or_create_user(user_id=user_id)
+                            tracking_service.start_conversation(conversation_id=session_id, user_id=user_id)
+                            logger.debug(f"Database tracking initialized for user {user_id}, session {session_id}")
+                        except Exception as tracking_error:
+                            logger.error(f"Failed to initialize database tracking: {tracking_error}")
+
                     # Get or create conversation context
                     context = context_manager.get_or_create_context(user_id=user_id, session_id=session_id)
                     logger.info(f"Context loaded: {len(context.conversation_history)} messages in history")
@@ -239,22 +307,78 @@ def create_application() -> FastAPI:
                         except Exception as create_error:
                             logger.debug(f"Session already exists for {user_id}: {create_error}")
 
-                    # Inject context summary into the message if available
-                    enhanced_message = message
+                    # Inject user WhatsApp ID, session context, and analytics IDs into the message
+                    # The agent needs to know the user's WhatsApp ID for sending images
+                    # AND the conversation_id/user_id for analytics tracking
+                    enhanced_message = f"[USER WHATSAPP ID: {user_id}]\n"
+                    enhanced_message += f"[CONVERSATION ID: {session_id}]\n"
+                    enhanced_message += f"[USER ID FOR ANALYTICS: {user_id}]\n\n"
+                    enhanced_message += "**IMPORTANT: Include these IDs in ALL Shopify operations:**\n"
+                    enhanced_message += f"- conversation_id: \"{session_id}\"\n"
+                    enhanced_message += f"- user_id: \"{user_id}\"\n\n"
+
                     if context_summary:
                         # Prepend context to user message (invisible to user, visible to agent)
-                        enhanced_message = f"[CONTEXT FROM PREVIOUS TURNS]\n{context_summary}\n\n[CURRENT USER MESSAGE]\n{message}"
+                        enhanced_message += f"[CONTEXT FROM PREVIOUS TURNS]\n{context_summary}\n\n"
+
+                    enhanced_message += f"[CURRENT USER MESSAGE]\n{message}"
+
+                    # Track user message in database
+                    if tracking_service:
+                        try:
+                            tracking_service.record_message(
+                                conversation_id=session_id,
+                                role="user",
+                                content=message,
+                                metadata={"message_id": message_id}
+                            )
+                        except Exception as tracking_error:
+                            logger.error(f"Failed to track user message: {tracking_error}")
 
                     # Create user message content
                     user_message = Content(role="user", parts=[Part.from_text(text=enhanced_message)])
 
                     # Run agent asynchronously via Runner
                     response_text = ""
+                    whatsapp_tool_used = False
+                    agent_actions = []  # Track actions for database
+
                     async for event in runner.run_async(
                         user_id=user_id,
                         session_id=session_id,
                         new_message=user_message
                     ):
+                        # Check if WhatsApp tools were used and track all function calls
+                        if hasattr(event, 'content') and event.content:
+                            for part in event.content.parts:
+                                if hasattr(part, 'function_call') and part.function_call:
+                                    func_name = part.function_call.name
+                                    func_args = dict(part.function_call.args) if part.function_call.args else {}
+
+                                    # Track WhatsApp tool usage
+                                    if func_name in ['send_whatsapp_message', 'send_whatsapp_image']:
+                                        whatsapp_tool_used = True
+                                        logger.info(f"Detected WhatsApp tool usage: {func_name}")
+
+                                    # Collect agent action for database tracking
+                                    agent_actions.append({
+                                        "action_type": func_name,
+                                        "parameters": func_args,
+                                        "timestamp": "event_time"
+                                    })
+
+                                # Track function responses (results)
+                                if hasattr(part, 'function_response') and part.function_response:
+                                    func_name = part.function_response.name
+                                    func_response = part.function_response.response
+
+                                    # Find matching action and add result
+                                    for action in agent_actions:
+                                        if action["action_type"] == func_name and "result" not in action:
+                                            action["result"] = dict(func_response) if func_response else {}
+                                            action["success"] = True  # If we got a response, assume success
+                                            break
+
                         if event.is_final_response():
                             response_text = event.content.parts[0].text
                             break
@@ -262,17 +386,68 @@ def create_application() -> FastAPI:
                     if not response_text:
                         response_text = "Hello! I'm Behold, your Shopify assistant. How can I help you today?"
 
+                    # Track assistant response in database
+                    if tracking_service:
+                        try:
+                            tracking_service.record_message(
+                                conversation_id=session_id,
+                                role="assistant",
+                                content=response_text,
+                                metadata={"whatsapp_tool_used": whatsapp_tool_used}
+                            )
+                        except Exception as tracking_error:
+                            logger.error(f"Failed to track assistant message: {tracking_error}")
+
+                    # Track agent actions in database
+                    if tracking_service and agent_actions:
+                        for action in agent_actions:
+                            try:
+                                action_type = action.get("action_type", "unknown")
+                                result_data = action.get("result", {})
+
+                                # Track the action
+                                tracking_service.record_agent_action(
+                                    conversation_id=session_id,
+                                    action_type=action_type,
+                                    parameters=action.get("parameters", {}),
+                                    result=result_data,
+                                    success=action.get("success", True),
+                                    error_message=action.get("error_message")
+                                )
+
+                                # Track product views from search results
+                                if "search" in action_type.lower() or "product" in action_type.lower():
+                                    try:
+                                        products = result_data.get("products", [])
+                                        for product in products[:10]:  # Track first 10 products shown
+                                            product_id = product.get("id")
+                                            if product_id:
+                                                tracking_service.record_product_view(
+                                                    conversation_id=session_id,
+                                                    product_id=product_id,
+                                                    product_title=product.get("title"),
+                                                    product_price=float(product.get("priceRange", {}).get("minVariantPrice", {}).get("amount", 0)),
+                                                    product_type=product.get("productType"),
+                                                    recommended_by_agent=True
+                                                )
+                                    except Exception as pv_error:
+                                        logger.error(f"Failed to track product views: {pv_error}")
+
+                            except Exception as tracking_error:
+                                logger.error(f"Failed to track agent action: {tracking_error}")
+
                     # Store this turn in context (async for thread safety)
                     await context.add_turn(
                         user_message=message,
                         assistant_response=response_text,
                         metadata={
                             "user": {"message_id": message_id},
-                            "assistant": {}
+                            "assistant": {"whatsapp_tool_used": whatsapp_tool_used}
                         }
                     )
 
                     logger.info(f"Agent response: {response_text}")
+                    logger.info(f"WhatsApp tools used: {whatsapp_tool_used}")
                     logger.info(f"Context updated: {len(context.conversation_history)} messages in history")
 
                 except Exception as agent_error:
@@ -282,7 +457,14 @@ def create_application() -> FastAPI:
                 logger.error("Agent not available")
                 raise HTTPException(status_code=500, detail="Agent not available")
 
-            return {"reply": response_text}
+            # If agent used WhatsApp tools, it already sent the message
+            # If not, return the response so the bridge can send it
+            if whatsapp_tool_used:
+                logger.info("Agent used WhatsApp tools - no need to send response again")
+                return {"status": "success", "message": "Agent sent messages directly via WhatsApp tools"}
+            else:
+                logger.info("Agent did not use WhatsApp tools - returning response for bridge to send")
+                return {"reply": response_text}
 
         except Exception as e:
             logger.error(f"Error processing WhatsApp message: {e}")
@@ -293,7 +475,6 @@ def create_application() -> FastAPI:
 
 # Create the app
 app = create_application()
-app.router.lifespan_context = lifespan
 
 
 def main():

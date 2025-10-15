@@ -56,9 +56,11 @@ def send_whatsapp_message(to: str, message: str) -> Dict[str, Any]:
             }
         else:
             error_data = response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text}
+            error_msg = f"Bridge error: {error_data.get('error', 'Unknown error')}"
+            logger.error(f"Failed to send via WhatsApp. Status: {response.status_code}, Error: {error_msg}")
             return {
                 "success": False,
-                "error": f"Bridge error: {error_data.get('error', 'Unknown error')}",
+                "error": error_msg,
                 "recipient": to,
                 "status_code": response.status_code
             }
@@ -78,6 +80,93 @@ def send_whatsapp_message(to: str, message: str) -> Dict[str, Any]:
     except Exception as e:
         error_msg = f"Unexpected error sending WhatsApp message: {str(e)}"
         logger.error(error_msg)
+        return {
+            "success": False,
+            "error": error_msg,
+            "recipient": to
+        }
+
+
+def send_whatsapp_image(to: str, image_url: str, caption: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Send an image via WhatsApp Web.js bridge.
+
+    Args:
+        to: Recipient phone number (with country code, no + symbol)
+        image_url: URL of the image to send
+        caption: Optional caption for the image
+
+    Returns:
+        Dict containing success status and response details
+    """
+    bridge_url = os.getenv("WHATSAPP_BRIDGE_URL", "http://localhost:3001")
+
+    logger.info(f"Attempting to send WhatsApp image to {to}")
+    logger.info(f"Image URL: {image_url}")
+    logger.info(f"Caption: {caption}")
+
+    try:
+        # Send image URL directly to the bridge - let the bridge download it
+        response = requests.post(
+            f"{bridge_url}/send-image",
+            json={
+                "to": to,
+                "image": image_url,
+                "imageType": "url",
+                "caption": caption
+            },
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(f"WhatsApp image sent successfully to {to}")
+
+            return {
+                "success": True,
+                "recipient": result.get("to", to),
+                "image_url": image_url,
+                "caption": caption,
+                "bridge_response": result
+            }
+        elif response.status_code == 503:
+            # WhatsApp client not ready
+            return {
+                "success": False,
+                "error": "WhatsApp client is not ready. Please scan QR code first.",
+                "recipient": to,
+                "status_code": 503
+            }
+        else:
+            error_data = response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text}
+            error_msg = f"Bridge error: {error_data.get('error', 'Unknown error')}"
+            logger.error(f"Failed to send via WhatsApp. Status: {response.status_code}, Error: {error_msg}")
+            return {
+                "success": False,
+                "error": error_msg,
+                "recipient": to,
+                "status_code": response.status_code
+            }
+
+    except requests.exceptions.ConnectionError as e:
+        error_msg = f"Cannot connect to WhatsApp bridge at {bridge_url}. Is the bridge server running?"
+        logger.error(f"{error_msg} - {str(e)}")
+        return {
+            "success": False,
+            "error": error_msg,
+            "recipient": to
+        }
+    except requests.exceptions.Timeout as e:
+        error_msg = "Timeout communicating with WhatsApp bridge"
+        logger.error(f"{error_msg} - {str(e)}")
+        return {
+            "success": False,
+            "error": error_msg,
+            "recipient": to
+        }
+    except Exception as e:
+        error_msg = f"Unexpected error sending WhatsApp image: {str(e)}"
+        logger.error(error_msg, exc_info=True)
         return {
             "success": False,
             "error": error_msg,

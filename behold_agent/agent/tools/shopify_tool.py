@@ -17,6 +17,20 @@ logger = logging.getLogger(__name__)
 _mcp_conversation_id = None
 _mcp_api_contexts = {}  # Track which APIs have been initialized
 
+# Import analytics tracking service
+# Use absolute import matching main.py's import style
+try:
+    from analytics.tracking_service import tracking_service
+    from analytics.database import Conversation, db_manager
+    _tracking_enabled = True
+    logger.info("Analytics tracking service loaded successfully")
+except ImportError as e:
+    logger.warning(f"Analytics tracking service not available: {e}")
+    tracking_service = None
+    db_manager = None
+    Conversation = None
+    _tracking_enabled = False
+
 
 class MCPError(Exception):
     """Custom exception for MCP-related errors"""
@@ -596,27 +610,48 @@ def _fallback_operation(intent: str, parameters: Dict[str, Any], api: str) -> Di
     Fallback to hardcoded queries for common operations when MCP fails.
     """
     intent_lower = intent.lower()
-    
+
+    # Extract conversation_id for tracking
+    conversation_id = parameters.get("conversation_id")
+
     # Product search fallback
     if "search" in intent_lower and "product" in intent_lower:
-        return _execute_product_search(parameters.get("query", ""), parameters.get("first", 20))
-    
+        return _execute_product_search(
+            parameters.get("query", ""),
+            parameters.get("first", 20),
+            conversation_id=conversation_id
+        )
+
     # Cart creation fallback
     elif "create" in intent_lower and "cart" in intent_lower:
-        return _execute_cart_creation(parameters.get("lines", []))
-    
+        # Extract attribution context if provided
+        user_id = parameters.get("user_id")
+        return _execute_cart_creation(parameters.get("lines", []), conversation_id, user_id)
+
+    # Add to cart fallback (CRITICAL: Check this BEFORE "get cart" since both contain "cart")
+    elif "add" in intent_lower and "cart" in intent_lower:
+        return _execute_add_to_cart(
+            parameters.get("cart_id", ""),
+            parameters.get("lines", []),
+            conversation_id=conversation_id
+        )
+
     # Get cart fallback
     elif "get" in intent_lower and "cart" in intent_lower:
         return _execute_get_cart(parameters.get("cart_id", ""))
-    
+
+    # Modify cart fallback
+    elif "modify" in intent_lower and "cart" in intent_lower:
+        return _execute_modify_cart(parameters.get("cart_id", ""), parameters.get("lines", []))
+
     # Apply discount fallback
     elif "discount" in intent_lower or "coupon" in intent_lower:
         return _execute_apply_discount(parameters.get("cart_id", ""), parameters.get("codes", []))
-    
+
     # Shipping calculation fallback
     elif "shipping" in intent_lower or "delivery" in intent_lower:
         return _execute_shipping_calculation(parameters.get("cart_id", ""), parameters.get("address", {}))
-    
+
     else:
         return {
             "status": "error",
@@ -629,25 +664,62 @@ def _format_operation_result(intent: str, data: Dict[str, Any], parameters: Dict
     Format GraphQL response data into user-friendly format based on operation intent.
     """
     intent_lower = intent.lower()
-    
+
     # Format product search results
     if "search" in intent_lower and "product" in intent_lower:
         # Handle both GraphQL format (edges) and direct array format
         if "edges" in data.get("products", {}):
             # Raw GraphQL format
             products = data.get("products", {}).get("edges", [])
+            formatted_products = []
+
+            for edge in products:
+                node = edge["node"]
+                # Extract image URL if available
+                image_url = None
+                images = node.get("images", {}).get("edges", [])
+                if images:
+                    image_url = images[0].get("node", {}).get("url")
+
+                # Create formatted product with image metadata
+                formatted_product = {
+                    **node,
+                    "primary_image_url": image_url,
+                    "has_image": bool(image_url)
+                }
+                formatted_products.append(formatted_product)
+
             return {
-                "products": [edge["node"] for edge in products],
+                "products": formatted_products,
                 "total_found": len(products),
-                "search_query": parameters.get("query", "")
+                "search_query": parameters.get("query", ""),
+                "has_images": any(p.get("has_image") for p in formatted_products)
             }
         else:
             # Direct array format from fallback
             products = data.get("products", [])
+            formatted_products = []
+
+            for product in products:
+                # Extract image URL if available
+                image_url = None
+                images = product.get("images", {}).get("edges", [])
+                if images:
+                    image_url = images[0].get("node", {}).get("url")
+
+                # Create formatted product with image metadata
+                formatted_product = {
+                    **product,
+                    "primary_image_url": image_url,
+                    "has_image": bool(image_url)
+                }
+                formatted_products.append(formatted_product)
+
             return {
-                "products": products,
+                "products": formatted_products,
                 "total_found": len(products),
-                "search_query": parameters.get("query", "")
+                "search_query": parameters.get("query", ""),
+                "has_images": any(p.get("has_image") for p in formatted_products)
             }
     
     # Format cart operations
@@ -660,11 +732,29 @@ def _format_operation_result(intent: str, data: Dict[str, Any], parameters: Dict
                 "total_quantity": len(cart_data.get("lines", {}).get("edges", [])),
                 "cost": cart_data.get("cost", {})
             }
+        elif "cartLinesAdd" in data:
+            cart_data = data["cartLinesAdd"]["cart"]
+            return {
+                "cart_id": cart_data.get("id"),
+                "checkout_url": cart_data.get("checkoutUrl"),
+                "lines": cart_data.get("lines", {}).get("edges", []),
+                "cost": cart_data.get("cost", {}),
+                "operation": "add"
+            }
+        elif "cartLinesUpdate" in data:
+            cart_data = data["cartLinesUpdate"]["cart"]
+            return {
+                "cart_id": cart_data.get("id"),
+                "checkout_url": cart_data.get("checkoutUrl"),
+                "lines": cart_data.get("lines", {}).get("edges", []),
+                "cost": cart_data.get("cost", {}),
+                "operation": "modify"
+            }
         elif "cart" in data:
             cart_data = data["cart"]
             return {
                 "cart_id": cart_data.get("id"),
-                "checkout_url": cart_data.get("checkoutUrl"), 
+                "checkout_url": cart_data.get("checkoutUrl"),
                 "lines": cart_data.get("lines", {}).get("edges", []),
                 "cost": cart_data.get("cost", {})
             }
@@ -691,17 +781,17 @@ def _format_operation_result(intent: str, data: Dict[str, Any], parameters: Dict
 
 
 # Fallback implementations for core operations
-def _execute_product_search(query: str, first: int = 20) -> Dict[str, Any]:
+def _execute_product_search(query: str, first: int = 20, conversation_id: Optional[str] = None) -> Dict[str, Any]:
     """Fallback product search with intelligent query handling."""
     if not query:
         return {
             "status": "error",
             "error_message": "Please provide a search term to find products."
         }
-    
+
     # Clean the query
     cleaned_query = query.strip()
-    
+
     # If query is very generic or short, get all products
     if not cleaned_query or len(cleaned_query) <= 2 or cleaned_query.lower() in ['*', 'all', 'any', 'product', 'item']:
         # Get all products without filter
@@ -715,6 +805,7 @@ def _execute_product_search(query: str, first: int = 20) -> Dict[str, Any]:
                         handle
                         description
                         availableForSale
+                        productType
                         priceRange {
                             minVariantPrice {
                                 amount
@@ -760,6 +851,7 @@ def _execute_product_search(query: str, first: int = 20) -> Dict[str, Any]:
                         handle
                         description
                         availableForSale
+                        productType
                         priceRange {
                             minVariantPrice {
                                 amount
@@ -793,12 +885,12 @@ def _execute_product_search(query: str, first: int = 20) -> Dict[str, Any]:
         }
         """
         variables = {"query": cleaned_query, "first": min(first, 100)}
-    
+
     result = execute_shopify_graphql(graphql_query, variables, "storefront")
-    
+
     if result["status"] == "success":
         products = result["data"].get("products", {}).get("edges", [])
-        
+
         # If search query returned no results, try getting all products as fallback
         if not products and cleaned_query and len(cleaned_query) > 2:
             print(f"No products found for '{cleaned_query}', getting all products...")
@@ -812,6 +904,7 @@ def _execute_product_search(query: str, first: int = 20) -> Dict[str, Any]:
                             handle
                             description
                             availableForSale
+                            productType
                             priceRange {
                                 minVariantPrice {
                                     amount
@@ -826,31 +919,81 @@ def _execute_product_search(query: str, first: int = 20) -> Dict[str, Any]:
             fallback_result = execute_shopify_graphql(fallback_query, {"first": min(first, 100)}, "storefront")
             if fallback_result["status"] == "success":
                 products = fallback_result["data"].get("products", {}).get("edges", [])
-        
+
+        # Track product views for analytics
+        if _tracking_enabled and conversation_id and products:
+            try:
+                for edge in products:
+                    node = edge.get("node", {})
+                    product_id = node.get("id")
+                    product_title = node.get("title")
+                    product_type = node.get("productType")
+                    price_data = node.get("priceRange", {}).get("minVariantPrice", {})
+                    product_price = float(price_data.get("amount", 0)) if price_data.get("amount") else None
+
+                    if product_id:
+                        tracking_service.record_product_view(
+                            conversation_id=conversation_id,
+                            product_id=product_id,
+                            product_title=product_title,
+                            product_price=product_price,
+                            product_type=product_type,
+                            recommended_by_agent=True
+                        )
+                logger.info(f"Tracked {len(products)} product views for conversation {conversation_id}")
+
+                # Increment products_searched counter for funnel analytics
+                session = db_manager.get_session()
+                try:
+                    conversation = session.query(Conversation).filter_by(id=conversation_id).first()
+                    if conversation:
+                        conversation.products_searched += 1
+                        session.commit()
+                        logger.debug(f"Incremented products_searched for conversation {conversation_id}")
+                except Exception as db_error:
+                    session.rollback()
+                    logger.error(f"Failed to increment products_searched: {db_error}")
+                finally:
+                    session.close()
+
+            except Exception as e:
+                logger.error(f"Failed to track product views: {e}")
+
         return {
             "status": "success",
             "products": [edge["node"] for edge in products],
             "total_found": len(products),
             "search_query": cleaned_query
         }
-    
+
     return result
 
 
-def _execute_cart_creation(lines: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Fallback cart creation with hardcoded query."""
+def _execute_cart_creation(lines: List[Dict[str, Any]], conversation_id: Optional[str] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Fallback cart creation with hardcoded query.
+
+    Args:
+        lines: Cart line items
+        conversation_id: Optional conversation ID for attribution
+        user_id: Optional user ID for attribution
+    """
     if not lines:
         return {
             "status": "error",
             "error_message": "Please provide items to add to the cart."
         }
-    
+
     graphql_query = """
     mutation cartCreate($input: CartInput!) {
         cartCreate(input: $input) {
             cart {
                 id
                 checkoutUrl
+                attributes {
+                    key
+                    value
+                }
                 lines(first: 10) {
                     edges {
                         node {
@@ -886,10 +1029,22 @@ def _execute_cart_creation(lines: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
     }
     """
-    
-    variables = {"input": {"lines": lines}}
+
+    # Build cart input with optional attribution
+    cart_input = {"lines": lines}
+
+    # Add attribution if conversation_id and user_id provided
+    if conversation_id and user_id:
+        cart_input["attributes"] = [
+            {"key": "_agent_conversation_id", "value": conversation_id},
+            {"key": "_agent_user_id", "value": user_id},
+            {"key": "_agent_source", "value": "behold_whatsapp_agent"},
+        ]
+        logger.info(f"Creating cart with attribution: conversation={conversation_id}, user={user_id}")
+
+    variables = {"input": cart_input}
     result = execute_shopify_graphql(graphql_query, variables, "storefront")
-    
+
     if result["status"] == "success":
         cart_data = result["data"].get("cartCreate", {})
         if cart_data.get("userErrors"):
@@ -897,14 +1052,51 @@ def _execute_cart_creation(lines: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "status": "error",
                 "error_message": f"Cart creation failed: {cart_data['userErrors'][0].get('message')}"
             }
-        
+
         cart = cart_data.get("cart", {})
+        cart_id = cart.get("id")
+        checkout_url = cart.get("checkoutUrl")
+        cart_lines = cart.get("lines", {}).get("edges", [])
+        cost = cart.get("cost", {})
+
+        # Track cart in database if conversation_id provided
+        if conversation_id and cart_id:
+            try:
+                from analytics import tracking_service
+                if tracking_service:
+                    # Extract cart items for tracking
+                    items = []
+                    for edge in cart_lines:
+                        node = edge.get("node", {})
+                        merchandise = node.get("merchandise", {})
+                        items.append({
+                            "product_id": merchandise.get("product", {}).get("id"),
+                            "variant_id": merchandise.get("id"),
+                            "quantity": node.get("quantity"),
+                            "title": merchandise.get("product", {}).get("title")
+                        })
+
+                    total_amount = float(cost.get("totalAmount", {}).get("amount", 0))
+                    currency = cost.get("totalAmount", {}).get("currencyCode", "USD")
+
+                    tracking_service.record_cart_creation(
+                        cart_id=cart_id,
+                        conversation_id=conversation_id,
+                        checkout_url=checkout_url,
+                        items=items,
+                        subtotal_amount=total_amount,
+                        currency=currency
+                    )
+                    logger.info(f"Cart tracked in database: {cart_id}")
+            except Exception as e:
+                logger.error(f"Failed to track cart in database: {e}")
+
         return {
             "status": "success",
-            "cart_id": cart.get("id"),
-            "checkout_url": cart.get("checkoutUrl"),
-            "total_quantity": len(cart.get("lines", {}).get("edges", [])),
-            "cost": cart.get("cost", {})
+            "cart_id": cart_id,
+            "checkout_url": checkout_url,
+            "total_quantity": len(cart_lines),
+            "cost": cost
         }
     
     return result
@@ -980,6 +1172,216 @@ def _execute_get_cart(cart_id: str) -> Dict[str, Any]:
     
     return result
 
+def _execute_add_to_cart(cart_id: str, lines: List[Dict[str, Any]], conversation_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Add NEW items to an existing cart using cartLinesAdd.
+    CRITICAL: This is DIFFERENT from cartLinesUpdate - this adds new products!
+    """
+    if not cart_id:
+        return {
+            "status": "error",
+            "error_message": "Please provide a cart ID to add items to."
+        }
+
+    if not lines:
+        return {
+            "status": "error",
+            "error_message": "Please provide items to add to the cart."
+        }
+
+    graphql_query = """
+    mutation cartLinesAdd($cartId: ID!, $lines: [CartLineInput!]!) {
+        cartLinesAdd(cartId: $cartId, lines: $lines) {
+            cart {
+                id
+                checkoutUrl
+                lines(first: 50) {
+                    edges {
+                        node {
+                            id
+                            quantity
+                            merchandise {
+                                ... on ProductVariant {
+                                    id
+                                    title
+                                    price {
+                                        amount
+                                        currencyCode
+                                    }
+                                    product {
+                                        id
+                                        title
+                                        handle
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                cost {
+                    totalAmount {
+                        amount
+                        currencyCode
+                    }
+                    subtotalAmount {
+                        amount
+                        currencyCode
+                    }
+                }
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+
+    variables = {"cartId": cart_id, "lines": lines}
+    result = execute_shopify_graphql(graphql_query, variables, "storefront")
+
+    if result["status"] == "success":
+        cart_data = result["data"].get("cartLinesAdd", {})
+        if cart_data.get("userErrors"):
+            return {
+                "status": "error",
+                "error_message": f"Adding to cart failed: {cart_data['userErrors'][0].get('message')}"
+            }
+
+        cart = cart_data.get("cart", {})
+        cart_lines = cart.get("lines", {}).get("edges", [])
+
+        # Track products added to cart
+        if _tracking_enabled and conversation_id:
+            try:
+                # Track cart update
+                items = []
+                for edge in cart_lines:
+                    node = edge.get("node", {})
+                    merchandise = node.get("merchandise", {})
+                    product = merchandise.get("product", {})
+                    product_id = product.get("id")
+
+                    items.append({
+                        "product_id": product_id,
+                        "variant_id": merchandise.get("id"),
+                        "quantity": node.get("quantity"),
+                        "title": product.get("title")
+                    })
+
+                    # Mark product as added to cart in analytics
+                    if product_id:
+                        tracking_service.mark_product_added_to_cart(
+                            conversation_id=conversation_id,
+                            product_id=product_id
+                        )
+
+                # Update cart in database
+                cost = cart.get("cost", {})
+                total_amount = float(cost.get("totalAmount", {}).get("amount", 0))
+                tracking_service.record_cart_update(
+                    cart_id=cart_id,
+                    items=items,
+                    subtotal_amount=total_amount
+                )
+                logger.info(f"Tracked cart update for conversation {conversation_id}")
+            except Exception as e:
+                logger.error(f"Failed to track cart update: {e}")
+
+        return {
+            "status": "success",
+            "cart_id": cart.get("id"),
+            "checkout_url": cart.get("checkoutUrl"),
+            "lines": cart_lines,
+            "cost": cart.get("cost", {}),
+            "operation": "add"
+        }
+
+    return result
+
+
+def _execute_modify_cart(cart_id: str, lines: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Fallback cart modification with hardcoded query."""
+    if not cart_id:
+        return {
+            "status": "error",
+            "error_message": "Please provide a cart ID."
+        }
+    
+    if not lines:
+        return {
+            "status": "error",
+            "error_message": "Please provide line items to update."
+        }
+    
+    graphql_query = """
+    mutation cartLinesUpdate($cartId: ID!, $lines: [CartLineUpdateInput!]!) {
+        cartLinesUpdate(cartId: $cartId, lines: $lines) {
+            cart {
+                id
+                checkoutUrl
+                lines(first: 50) {
+                    edges {
+                        node {
+                            id
+                            quantity
+                            merchandise {
+                                ... on ProductVariant {
+                                    id
+                                    title
+                                    price {
+                                        amount
+                                        currencyCode
+                                    }
+                                    product {
+                                        title
+                                        handle
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                cost {
+                    totalAmount {
+                        amount
+                        currencyCode
+                    }
+                    subtotalAmount {
+                        amount
+                        currencyCode
+                    }
+                }
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+    
+    variables = {"cartId": cart_id, "lines": lines}
+    result = execute_shopify_graphql(graphql_query, variables, "storefront")
+    
+    if result["status"] == "success":
+        cart_data = result["data"].get("cartLinesUpdate", {})
+        if cart_data.get("userErrors"):
+            return {
+                "status": "error",
+                "error_message": f"Cart modification failed: {cart_data['userErrors'][0].get('message')}"
+            }
+        
+        cart = cart_data.get("cart", {})
+        return {
+            "status": "success",
+            "cart_id": cart.get("id"),
+            "checkout_url": cart.get("checkoutUrl"),
+            "lines": cart.get("lines", {}).get("edges", []),
+            "cost": cart.get("cost", {})
+        }
+    
+    return result
 
 def _execute_apply_discount(cart_id: str, codes: List[str]) -> Dict[str, Any]:
     """Fallback discount application with hardcoded query."""
