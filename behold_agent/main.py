@@ -42,7 +42,7 @@ try:
     from agent.agent import root_agent
     from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
-    from google.genai.types import Content, Part
+    from google.adk.messages import Content, Part
     from agent.session_context import context_manager
 
     agent_available = True
@@ -52,12 +52,13 @@ try:
     APP_NAME = "behold_whatsapp_agent"
     session_service = InMemorySessionService()
     runner = Runner(
-        agent=root_agent,
+        agent=root_agent,  # Use the ADK agent directly (now with callbacks)
         app_name=APP_NAME,
         session_service=session_service
     )
-    logger.info("✅ ADK Runner initialized")
+
     logger.info("✅ Context manager initialized")
+    logger.info("✅ ADK callbacks are automatically registered with the agent")
     # Validate Shopify environment at startup
     def validate_shopify_config():
         """Validate Shopify configuration and test connectivity."""
@@ -436,19 +437,15 @@ def create_application() -> FastAPI:
                             except Exception as tracking_error:
                                 logger.error(f"Failed to track agent action: {tracking_error}")
 
-                    # Store this turn in context (async for thread safety)
-                    await context.add_turn(
-                        user_message=message,
-                        assistant_response=response_text,
-                        metadata={
-                            "user": {"message_id": message_id},
-                            "assistant": {"whatsapp_tool_used": whatsapp_tool_used}
-                        }
-                    )
+                    # Note: Message saving to state is now handled automatically by ADK callbacks
+                    # in agent/agent.py (before_agent_callback and after_agent_callback)
 
                     logger.info(f"Agent response: {response_text}")
                     logger.info(f"WhatsApp tools used: {whatsapp_tool_used}")
-                    logger.info(f"Context updated: {len(context.conversation_history)} messages in history")
+                    
+                    # Get the context for logging purposes (context is still maintained separately)
+                    context = context_manager.get_or_create_context(user_id=user_id, session_id=session_id)
+                    logger.info(f"Context status: {len(context.conversation_history)} messages in history")
 
                 except Exception as agent_error:
                     logger.error(f"Agent processing failed: {agent_error}")
