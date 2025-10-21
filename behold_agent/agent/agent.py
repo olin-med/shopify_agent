@@ -1,7 +1,4 @@
 from google.adk.agents import Agent
-from google.adk.agents.callback_context import CallbackContext
-from google.genai import types
-from typing import Optional
 import logging
 from .prompt import BEHOLD_AGENT_PROMPT
 from .callbacks import before_agent_callback, after_agent_callback
