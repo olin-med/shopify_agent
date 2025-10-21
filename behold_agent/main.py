@@ -42,7 +42,7 @@ try:
     from agent.agent import root_agent
     from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
-    from google.genai.types import Content, Part
+    from google.adk.messages import Content, Part
     from agent.session_context import context_manager
 
     agent_available = True
@@ -52,12 +52,13 @@ try:
     APP_NAME = "behold_whatsapp_agent"
     session_service = InMemorySessionService()
     runner = Runner(
-        agent=root_agent,
+        agent=root_agent,  # Use the ADK agent directly (now with callbacks)
         app_name=APP_NAME,
         session_service=session_service
     )
-    logger.info("✅ ADK Runner initialized")
+
     logger.info("✅ Context manager initialized")
+    logger.info("✅ ADK callbacks are automatically registered with the agent")
     # Validate Shopify environment at startup
     def validate_shopify_config():
         """Validate Shopify configuration and test connectivity."""
@@ -339,49 +340,58 @@ def create_application() -> FastAPI:
                     user_message = Content(role="user", parts=[Part.from_text(text=enhanced_message)])
 
                     # Run agent asynchronously via Runner
+                    logger.info(f"🎯 Starting agent execution for user {user_id}")
                     response_text = ""
                     whatsapp_tool_used = False
                     agent_actions = []  # Track actions for database
 
-                    async for event in runner.run_async(
-                        user_id=user_id,
-                        session_id=session_id,
-                        new_message=user_message
-                    ):
-                        # Check if WhatsApp tools were used and track all function calls
-                        if hasattr(event, 'content') and event.content:
-                            for part in event.content.parts:
-                                if hasattr(part, 'function_call') and part.function_call:
-                                    func_name = part.function_call.name
-                                    func_args = dict(part.function_call.args) if part.function_call.args else {}
+                    try:
+                        async for event in runner.run_async(
+                            user_id=user_id,
+                            session_id=session_id,
+                            new_message=user_message
+                        ):
+                            logger.debug(f"📥 Agent event received: {type(event).__name__}")
+                            # Check if WhatsApp tools were used and track all function calls
+                            if hasattr(event, 'content') and event.content:
+                                for part in event.content.parts:
+                                    if hasattr(part, 'function_call') and part.function_call:
+                                        func_name = part.function_call.name
+                                        func_args = dict(part.function_call.args) if part.function_call.args else {}
 
-                                    # Track WhatsApp tool usage
-                                    if func_name in ['send_whatsapp_message', 'send_whatsapp_image']:
-                                        whatsapp_tool_used = True
-                                        logger.info(f"Detected WhatsApp tool usage: {func_name}")
+                                        # Track WhatsApp tool usage
+                                        if func_name in ['send_whatsapp_message', 'send_whatsapp_image']:
+                                            whatsapp_tool_used = True
+                                            logger.info(f"Detected WhatsApp tool usage: {func_name}")
 
-                                    # Collect agent action for database tracking
-                                    agent_actions.append({
-                                        "action_type": func_name,
-                                        "parameters": func_args,
-                                        "timestamp": "event_time"
-                                    })
+                                        # Collect agent action for database tracking
+                                        agent_actions.append({
+                                            "action_type": func_name,
+                                            "parameters": func_args,
+                                            "timestamp": "event_time"
+                                        })
 
-                                # Track function responses (results)
-                                if hasattr(part, 'function_response') and part.function_response:
-                                    func_name = part.function_response.name
-                                    func_response = part.function_response.response
+                                    # Track function responses (results)
+                                    if hasattr(part, 'function_response') and part.function_response:
+                                        func_name = part.function_response.name
+                                        func_response = part.function_response.response
 
-                                    # Find matching action and add result
-                                    for action in agent_actions:
-                                        if action["action_type"] == func_name and "result" not in action:
-                                            action["result"] = dict(func_response) if func_response else {}
-                                            action["success"] = True  # If we got a response, assume success
-                                            break
+                                        # Find matching action and add result
+                                        for action in agent_actions:
+                                            if action["action_type"] == func_name and "result" not in action:
+                                                action["result"] = dict(func_response) if func_response else {}
+                                                action["success"] = True  # If we got a response, assume success
+                                                break
 
-                        if event.is_final_response():
-                            response_text = event.content.parts[0].text
-                            break
+                            if event.is_final_response():
+                                logger.info(f"🏁 Final response received from agent")
+                                response_text = event.content.parts[0].text
+                                break
+                        
+                        logger.info(f"✅ Agent execution completed successfully")
+                    except Exception as runner_error:
+                        logger.error(f"❌ Exception during agent execution: {runner_error}", exc_info=True)
+                        raise
 
                     if not response_text:
                         response_text = "Hello! I'm Behold, your Shopify assistant. How can I help you today?"
@@ -436,19 +446,15 @@ def create_application() -> FastAPI:
                             except Exception as tracking_error:
                                 logger.error(f"Failed to track agent action: {tracking_error}")
 
-                    # Store this turn in context (async for thread safety)
-                    await context.add_turn(
-                        user_message=message,
-                        assistant_response=response_text,
-                        metadata={
-                            "user": {"message_id": message_id},
-                            "assistant": {"whatsapp_tool_used": whatsapp_tool_used}
-                        }
-                    )
+                    # Note: Message saving to state is now handled automatically by ADK callbacks
+                    # in agent/agent.py (before_agent_callback and after_agent_callback)
 
                     logger.info(f"Agent response: {response_text}")
                     logger.info(f"WhatsApp tools used: {whatsapp_tool_used}")
-                    logger.info(f"Context updated: {len(context.conversation_history)} messages in history")
+                    
+                    # Get the context for logging purposes (context is still maintained separately)
+                    context = context_manager.get_or_create_context(user_id=user_id, session_id=session_id)
+                    logger.info(f"Context status: {len(context.conversation_history)} messages in history")
 
                 except Exception as agent_error:
                     logger.error(f"Agent processing failed: {agent_error}")

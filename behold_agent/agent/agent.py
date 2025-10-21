@@ -1,5 +1,7 @@
 from google.adk.agents import Agent
+import logging
 from .prompt import BEHOLD_AGENT_PROMPT
+from .callbacks import before_agent_callback, after_agent_callback
 from .tools import (
     fetch_shopify_graphql,
     validate_graphql_with_mcp,
@@ -14,6 +16,8 @@ from .tools import (
     get_whatsapp_qr_info,
     start_whatsapp_bridge,
 )
+
+logger = logging.getLogger(__name__)
 
 
 root_agent = Agent(
@@ -46,4 +50,7 @@ root_agent = Agent(
         get_whatsapp_qr_info,
         start_whatsapp_bridge,
     ],
+    # ADK callbacks for automatically saving messages to state
+    before_agent_callback=before_agent_callback,
+    after_agent_callback=after_agent_callback,
 )
