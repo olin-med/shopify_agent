@@ -10,3 +10,7 @@ wheels/
 .venv
 
 .env
+
+.wwebjs_*
+node_modules/
+whatsapp-bridge

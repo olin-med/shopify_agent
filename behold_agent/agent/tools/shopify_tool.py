@@ -2,270 +2,1818 @@ import os
 import subprocess
 import json
 import requests
+import uuid
+import logging
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
+# Configure logger for this module
+logger = logging.getLogger(__name__)
 
-def validate_graphql_with_mcp(query: str, api: str = "admin", version: str = "2025-07") -> Dict[str, Any]:
+# Global conversation state for MCP
+_mcp_conversation_id = None
+_mcp_api_contexts = {}  # Track which APIs have been initialized
+
+# Import analytics tracking service
+# Use absolute import matching main.py's import style
+try:
+    from analytics.tracking_service import tracking_service
+    from analytics.database import Conversation, db_manager
+    _tracking_enabled = True
+    logger.info("Analytics tracking service loaded successfully")
+except ImportError as e:
+    logger.warning(f"Analytics tracking service not available: {e}")
+    tracking_service = None
+    db_manager = None
+    Conversation = None
+    _tracking_enabled = False
+
+
+class MCPError(Exception):
+    """Custom exception for MCP-related errors"""
+    pass
+
+
+def _run_mcp_command(request: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
     """
-    Validates a GraphQL query using Shopify MCP server.
-    
+    Execute an MCP command and return parsed response.
+
     Args:
-        query (str): The GraphQL query to validate
-        api (str): The API to validate against (default: "admin")
-        version (str): The API version to validate against
-    
+        request: JSON-RPC request dictionary
+        timeout: Command timeout in seconds
+
     Returns:
-        Dict[str, Any]: Validation result with status and details
+        Dict containing the MCP response
+
+    Raises:
+        MCPError: If MCP command fails
     """
     try:
-        # Prepare the MCP command to validate GraphQL
-        mcp_command = [
-            "npx", "-y", "@shopify/dev-mcp@latest"
-        ]
-        
-        # Create the validation request
-        validation_request = {
+        mcp_command = ["npx", "-y", "@shopify/dev-mcp@latest"]
+
+        logger.debug(f"Running MCP command: {' '.join(mcp_command)}")
+        logger.debug(f"MCP request: {json.dumps(request, indent=2)}")
+
+        # Use Popen with communicate() for proper stdio handling
+        # MCP stdio protocol requires line-delimited JSON messages
+        proc = subprocess.Popen(
+            mcp_command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1  # Line buffering for proper MCP stdio communication
+        )
+
+        try:
+            # Send JSON with newline (MCP expects line-delimited JSON-RPC)
+            stdout, stderr = proc.communicate(
+                input=json.dumps(request) + '\n',
+                timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            logger.error(f"MCP command timed out after {timeout}s")
+            raise MCPError("MCP command timed out")
+
+        if proc.returncode != 0:
+            logger.error(f"MCP command failed with return code {proc.returncode}")
+            logger.error(f"MCP stderr: {stderr}")
+            raise MCPError(f"MCP command failed: {stderr}")
+
+        # Check if stdout is empty
+        if not stdout or stdout.strip() == "":
+            logger.error("MCP returned empty response")
+            logger.error(f"MCP stderr: {stderr}")
+            raise MCPError("MCP returned empty response - the MCP service may not be responding correctly")
+
+        # Parse JSON from multi-line output (MCP may output debug logs + JSON)
+        # Try to find and parse the JSON-RPC response line
+        response = None
+        for line in stdout.strip().split('\n'):
+            line = line.strip()
+            # Skip debug/log lines (e.g., [shopify-dev-fetch] ...)
+            if not line or line.startswith('[') or not line.startswith('{'):
+                continue
+            try:
+                parsed = json.loads(line)
+                # Check if it's a valid JSON-RPC response
+                if 'jsonrpc' in parsed and 'id' in parsed:
+                    response = parsed
+                    break
+            except json.JSONDecodeError:
+                continue
+
+        if response is None:
+            logger.error(f"Failed to parse JSON from MCP output. Raw output: {stdout}")
+            raise MCPError("MCP returned invalid JSON response")
+
+        logger.debug(f"MCP response: {json.dumps(response, indent=2)}")
+
+        if "error" in response:
+            logger.error(f"MCP returned error: {response['error']}")
+            raise MCPError(f"MCP error: {response['error']}")
+
+        return response
+
+    except MCPError:
+        # Re-raise MCPError as-is
+        raise
+    except FileNotFoundError as e:
+        # npx not found - likely Node.js not installed or not in PATH
+        logger.warning(f"npx command not found. Node.js may not be installed or not in PATH. Falling back to hardcoded queries.")
+        raise MCPError("MCP unavailable: npx command not found (Node.js required). Using fallback queries.")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse MCP response: {str(e)}")
+        raise MCPError(f"Failed to parse MCP response: {e}. MCP may not be available or is not responding correctly.")
+    except Exception as e:
+        logger.error(f"Unexpected MCP error: {str(e)}", exc_info=True)
+        raise MCPError(f"MCP command error: {str(e)}")
+
+
+def _normalize_api_for_mcp(api: str) -> str:
+    """
+    Normalize API parameter for MCP (which expects 'storefront-graphql' not 'storefront').
+
+    Args:
+        api: API name ("admin" or "storefront")
+
+    Returns:
+        MCP-compatible API name
+    """
+    if api == "storefront":
+        return "storefront-graphql"
+    return api
+
+
+def initialize_mcp_conversation(api: str = "admin") -> str:
+    """
+    Initialize MCP conversation for a specific API.
+
+    Args:
+        api: Shopify API to initialize ("admin" or "storefront")
+
+    Returns:
+        Conversation ID for subsequent MCP calls
+    """
+    global _mcp_conversation_id, _mcp_api_contexts
+
+    # Normalize API for MCP
+    mcp_api = _normalize_api_for_mcp(api)
+
+    # Generate conversation ID if not exists
+    if _mcp_conversation_id is None:
+        _mcp_conversation_id = str(uuid.uuid4())
+
+    # Skip if this API context is already initialized
+    if mcp_api in _mcp_api_contexts:
+        return _mcp_conversation_id
+
+    try:
+        request = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "validate_graphql_codeblocks",
+                "name": "learn_shopify_api",
                 "arguments": {
-                    "codeblocks": [query],
-                    "api": api,
-                    "version": version
+                    "api": mcp_api,
+                    "conversationId": _mcp_conversation_id
                 }
             }
         }
-        
-        # Run the MCP server validation
-        result = subprocess.run(
-            mcp_command,
-            input=json.dumps(validation_request),
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        if result.returncode == 0:
-            try:
-                response = json.loads(result.stdout)
-                if "result" in response:
-                    return {
-                        "status": "success",
-                        "validation_result": response["result"]
-                    }
-                else:
-                    return {
-                        "status": "error",
-                        "error_message": f"Unexpected MCP response format: {response}"
-                    }
-            except json.JSONDecodeError as e:
-                return {
-                    "status": "error", 
-                    "error_message": f"Failed to parse MCP response: {e}"
-                }
+
+        response = _run_mcp_command(request)
+
+        if response.get("result"):
+            _mcp_api_contexts[mcp_api] = True
+            return _mcp_conversation_id
         else:
-            return {
-                "status": "error",
-                "error_message": f"MCP validation failed: {result.stderr}"
-            }
-            
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "error",
-            "error_message": "GraphQL validation timed out"
-        }
+            raise MCPError(f"Failed to initialize {mcp_api} API context")
+
     except Exception as e:
-        return {
-            "status": "error",
-            "error_message": f"Validation error: {str(e)}"
-        }
+        raise MCPError(f"Failed to initialize MCP conversation for {mcp_api}: {str(e)}")
 
 
-def introspect_graphql_schema(search_term: str, api: str = "admin", version: str = "2025-07", 
-                            filter_types: List[str] = ["all"]) -> Dict[str, Any]:
+def search_shopify_docs(query: str, api: str = "admin", max_results: int = 5) -> Dict[str, Any]:
     """
-    Introspects Shopify GraphQL schema using MCP server.
+    Search Shopify documentation for relevant information.
     
     Args:
-        search_term (str): Term to search for in the schema
-        api (str): The API to introspect (default: "admin")
-        version (str): The API version to introspect
-        filter_types (List[str]): Types to filter ["all", "types", "queries", "mutations"]
+        query: Search query
+        api: Shopify API context
+        max_results: Maximum number of results
     
     Returns:
-        Dict[str, Any]: Schema introspection result
+        Search results from Shopify documentation
     """
     try:
-        # Prepare the MCP command
-        mcp_command = [
-            "npx", "-y", "@shopify/dev-mcp@latest"
-        ]
+        conversation_id = initialize_mcp_conversation(api)
         
-        # Create the introspection request
-        introspection_request = {
+        request = {
+            "jsonrpc": "2.0", 
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "search_docs_chunks",
+                "arguments": {
+                    "conversationId": conversation_id,
+                    "prompt": query,
+                    "max_num_results": max_results
+                }
+            }
+        }
+        
+        response = _run_mcp_command(request)
+        return {
+            "status": "success",
+            "docs": response.get("result", {}),
+            "query": query
+        }
+        
+    except MCPError as e:
+        return {
+            "status": "error",
+            "error_message": f"Documentation search failed: {str(e)}"
+        }
+
+
+def introspect_shopify_schema(search_term: str, api: str = "admin",
+                             filter_types: List[str] = ["all"]) -> Dict[str, Any]:
+    """
+    Introspect Shopify GraphQL schema using MCP.
+
+    Args:
+        search_term: Term to search for in schema
+        api: API to introspect ("admin" or "storefront")
+        filter_types: Types to filter (types, queries, mutations, all)
+
+    Returns:
+        Schema introspection results
+    """
+    try:
+        conversation_id = initialize_mcp_conversation(api)
+        mcp_api = _normalize_api_for_mcp(api)
+
+        request = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
             "params": {
                 "name": "introspect_graphql_schema",
                 "arguments": {
+                    "conversationId": conversation_id,
                     "query": search_term,
-                    "api": api,
-                    "version": version,
+                    "api": mcp_api,
                     "filter": filter_types
                 }
             }
         }
-        
-        # Run the MCP server introspection
-        result = subprocess.run(
-            mcp_command,
-            input=json.dumps(introspection_request),
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        if result.returncode == 0:
-            try:
-                response = json.loads(result.stdout)
-                if "result" in response:
-                    return {
-                        "status": "success",
-                        "schema_info": response["result"]
-                    }
-                else:
-                    return {
-                        "status": "error",
-                        "error_message": f"Unexpected MCP response format: {response}"
-                    }
-            except json.JSONDecodeError as e:
-                return {
-                    "status": "error",
-                    "error_message": f"Failed to parse MCP response: {e}"
+
+        response = _run_mcp_command(request)
+        return {
+            "status": "success",
+            "schema": response.get("result", {}),
+            "search_term": search_term
+        }
+
+    except MCPError as e:
+        return {
+            "status": "error",
+            "error_message": f"Schema introspection failed: {str(e)}"
+        }
+
+
+def validate_graphql_query(query: str, api: str = "admin") -> Dict[str, Any]:
+    """
+    Validate GraphQL query using MCP.
+
+    Args:
+        query: GraphQL query to validate
+        api: API to validate against ("admin" or "storefront")
+
+    Returns:
+        Validation results
+    """
+    try:
+        conversation_id = initialize_mcp_conversation(api)
+        mcp_api = _normalize_api_for_mcp(api)
+
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "validate_graphql_codeblocks",
+                "arguments": {
+                    "conversationId": conversation_id,
+                    "api": mcp_api,
+                    "codeblocks": [query]
                 }
-        else:
-            return {
-                "status": "error",
-                "error_message": f"MCP introspection failed: {result.stderr}"
             }
-            
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "error",
-            "error_message": "Schema introspection timed out"
         }
-    except Exception as e:
+
+        response = _run_mcp_command(request)
+        result = response.get("result", {})
+
+        if result and len(result.get("content", [])) > 0:
+            validation = result["content"][0]
+            is_valid = not validation.get("isError", True)
+
+            return {
+                "status": "success" if is_valid else "error",
+                "is_valid": is_valid,
+                "validation_details": validation,
+                "query": query
+            }
+
         return {
             "status": "error",
-            "error_message": f"Introspection error: {str(e)}"
+            "error_message": "No validation results returned"
+        }
+
+    except MCPError as e:
+        return {
+            "status": "error",
+            "error_message": f"Query validation failed: {str(e)}"
         }
 
 
-def fetch_shopify_graphql(
+def execute_shopify_graphql(
     query: str,
     variables: Optional[Dict[str, Any]] = None,
+    api: str = "storefront",
     shop: Optional[str] = None,
     api_version: Optional[str] = None,
-    access_token: Optional[str] = None,
-    validate_query: bool = True
+    access_token: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Fetches data from Shopify GraphQL API endpoint with optional validation.
-    
+    Execute a validated GraphQL query against Shopify APIs.
+
     Args:
-        query (str): The GraphQL query string
-        variables (Optional[Dict[str, Any]]): GraphQL variables if needed
-        shop (Optional[str]): The shop name (without .myshopify.com). If not provided, uses SHOPIFY_STORE from .env
-        api_version (Optional[str]): The API version (e.g., "2024-01"). If not provided, uses SHOPIFY_API_VERSION from .env
-        access_token (Optional[str]): The Shopify access token. If not provided, uses SHOPIFY_ADMIN_TOKEN from .env
-        validate_query (bool): Whether to validate the query using Shopify MCP before executing (default: True)
-    
+        query: GraphQL query string
+        variables: Query variables
+        api: API type ("admin" or "storefront")
+        shop: Shop name (from env if not provided)
+        api_version: API version (from env if not provided)
+        access_token: Access token (from env if not provided)
+
     Returns:
-        Dict[str, Any]: Response data or error information
+        GraphQL response data
     """
-    # Get values from environment variables if not provided
+    # Get environment variables
     shop = shop or os.getenv("SHOPIFY_STORE")
     api_version = api_version or os.getenv("SHOPIFY_API_VERSION", "2025-07")
-    access_token = access_token or os.getenv("SHOPIFY_ADMIN_TOKEN")
-    
+
+    if api == "admin":
+        access_token = access_token or os.getenv("SHOPIFY_ADMIN_TOKEN")
+        url = f"https://{shop}.myshopify.com/admin/api/{api_version}/graphql.json"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": access_token
+        }
+    else:  # storefront
+        access_token = access_token or os.getenv("SHOPIFY_STOREFRONT_TOKEN")
+        url = f"https://{shop}.myshopify.com/api/{api_version}/graphql.json"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Shopify-Storefront-Access-Token": access_token
+        }
+
     # Validate required parameters
     if not shop:
+        logger.error("SHOPIFY_STORE environment variable is not set")
         return {
             "status": "error",
-            "error_message": "Shop name is required. Set SHOPIFY_STORE in .env file or pass as parameter."
+            "error_message": "Shop name is required. Set SHOPIFY_STORE in .env file."
         }
-    
+
     if not access_token:
+        token_env = "SHOPIFY_ADMIN_TOKEN" if api == "admin" else "SHOPIFY_STOREFRONT_TOKEN"
+        logger.error(f"{token_env} environment variable is not set")
         return {
             "status": "error",
-            "error_message": "Access token is required. Set SHOPIFY_ADMIN_TOKEN in .env file or pass as parameter."
+            "error_message": f"Access token is required. Set {token_env} in .env file."
         }
-    
-    # Validate GraphQL query using MCP if requested
-    if validate_query:
-        validation_result = validate_graphql_with_mcp(query, "admin", api_version)
-        if validation_result["status"] == "error":
-            return {
-                "status": "validation_error",
-                "error_message": f"GraphQL validation failed: {validation_result['error_message']}",
-                "validation_details": validation_result
-            }
-        
-        # Check if validation found issues with the query
-        validation_info = validation_result.get("validation_result", {})
-        if validation_info.get("isError", False):
-            return {
-                "status": "validation_error", 
-                "error_message": "GraphQL query validation failed",
-                "validation_details": validation_info.get("content", [{}])[0].get("text", "Unknown validation error")
-            }
-    
-    url = f"https://{shop}.myshopify.com/admin/api/{api_version}/graphql.json"
-    
-    headers = {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": access_token
-    }
-    
-    payload = {
-        "query": query
-    }
-    
+
+    payload = {"query": query}
     if variables:
         payload["variables"] = variables
-    
+
+    logger.debug(f"Executing {api} GraphQL query to: {url}")
+    logger.debug(f"Query: {query[:200]}...")  # Log first 200 chars
+
     try:
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
         response.raise_for_status()
-        
+
         data = response.json()
-        
+
         if "errors" in data:
+            logger.error(f"GraphQL returned errors: {json.dumps(data['errors'], indent=2)}")
             return {
                 "status": "error",
                 "error_message": f"GraphQL errors: {data['errors']}"
             }
-        
+
+        logger.debug(f"GraphQL query successful. Response data keys: {list(data.get('data', {}).keys())}")
         return {
             "status": "success",
             "data": data.get("data", {}),
             "extensions": data.get("extensions", {})
         }
-        
+
     except requests.exceptions.RequestException as e:
+        logger.error(f"GraphQL request failed: {str(e)}", exc_info=True)
+        if hasattr(e, 'response') and e.response is not None:
+            logger.error(f"Response status: {e.response.status_code}")
+            logger.error(f"Response body: {e.response.text}")
         return {
             "status": "error",
             "error_message": f"Request failed: {str(e)}"
         }
     except Exception as e:
+        logger.error(f"Unexpected error in GraphQL execution: {str(e)}", exc_info=True)
         return {
             "status": "error",
             "error_message": f"Unexpected error: {str(e)}"
+        }
+
+
+def build_dynamic_query(intent: str, parameters: Dict[str, Any], api: str = "storefront") -> Dict[str, Any]:
+    """
+    Build GraphQL query dynamically using MCP documentation search.
+    
+    Args:
+        intent: User intent (e.g., "search products", "create cart", "calculate shipping")
+        parameters: Parameters for the operation
+        api: Target API ("admin" or "storefront")
+    
+    Returns:
+        Dict containing query and variables, or error
+    """
+    try:
+        # Search for relevant documentation and examples
+        search_result = search_shopify_docs(f"{intent} GraphQL {api} API", api)
+        
+        if search_result["status"] != "success":
+            return search_result
+        
+        docs = search_result.get("docs", {})
+        
+        # Extract GraphQL examples from documentation
+        content_items = docs.get("content", [])
+        
+        if not content_items:
+            return {
+                "status": "error",
+                "error_message": f"No documentation found for '{intent}' in {api} API"
+            }
+        
+        # Look for GraphQL code blocks in the documentation
+        query_examples = []
+        for item in content_items:
+            text = item.get("text", "")
+            if "query" in text.lower() or "mutation" in text.lower():
+                # Extract potential GraphQL from text
+                lines = text.split('\n')
+                in_code_block = False
+                current_query = []
+                
+                for line in lines:
+                    if '```' in line and ('graphql' in line.lower() or 'gql' in line.lower()):
+                        in_code_block = True
+                        continue
+                    elif '```' in line and in_code_block:
+                        if current_query:
+                            query_examples.append('\n'.join(current_query))
+                            current_query = []
+                        in_code_block = False
+                        continue
+                    elif in_code_block:
+                        current_query.append(line)
+        
+        if not query_examples:
+            # Try to introspect schema for relevant fields
+            schema_result = introspect_shopify_schema(intent.split()[0], api)
+            if schema_result["status"] == "success":
+                return {
+                    "status": "info",
+                    "message": f"Found schema information for '{intent}' but no query examples. Manual query building required.",
+                    "schema_info": schema_result["schema"]
+                }
+        
+        # Use the first suitable query example
+        base_query = query_examples[0] if query_examples else None
+        
+        if not base_query:
+            return {
+                "status": "error", 
+                "error_message": f"Could not find suitable GraphQL query for '{intent}'"
+            }
+        
+        # Validate the query
+        validation_result = validate_graphql_query(base_query, api)
+        
+        if validation_result["status"] != "success":
+            return {
+                "status": "error",
+                "error_message": f"Generated query is invalid: {validation_result.get('error_message')}"
+            }
+        
+        return {
+            "status": "success",
+            "query": base_query,
+            "variables": parameters,
+            "validation": validation_result
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Query building failed: {str(e)}"
+        }
+
+
+def execute_shopify_operation(
+    intent: str,
+    parameters: Dict[str, Any],
+    api: str
+) -> Dict[str, Any]:
+    """
+    Unified function to execute any Shopify operation using MCP-powered query building.
+
+    Args:
+        intent: User intent (e.g., "search products", "create cart", "get shipping rates")
+        parameters: Operation parameters
+        api: Target API ("admin" or "storefront")
+
+    Returns:
+        Operation result with user-friendly error handling
+    """
+    try:
+        # Set default API if not provided
+        if not api:
+            api = "storefront"
+
+        # Input validation
+        if not intent or not isinstance(intent, str):
+            return {
+                "status": "error",
+                "error_message": "Please specify what you'd like to do (e.g., 'search products', 'create cart')"
+            }
+
+        if not isinstance(parameters, dict):
+            parameters = {}
+        
+        # Build query dynamically using MCP
+        query_result = build_dynamic_query(intent, parameters, api)
+        
+        if query_result["status"] != "success":
+            # If dynamic building fails, try some common hardcoded patterns
+            return _fallback_operation(intent, parameters, api)
+        
+        query = query_result["query"]
+        variables = query_result["variables"]
+        
+        # Execute the query
+        execution_result = execute_shopify_graphql(query, variables, api)
+        
+        if execution_result["status"] != "success":
+            return {
+                "status": "error",
+                "error_message": f"Operation '{intent}' failed: {execution_result.get('error_message')}"
+            }
+        
+        # Process and format the response based on intent
+        formatted_result = _format_operation_result(intent, execution_result["data"], parameters)
+        
+        return {
+            "status": "success",
+            "intent": intent,
+            "data": formatted_result,
+            "raw_data": execution_result["data"]
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Operation '{intent}' encountered an error: {str(e)}"
+        }
+
+
+def _fallback_operation(intent: str, parameters: Dict[str, Any], api: str) -> Dict[str, Any]:
+    """
+    Fallback to hardcoded queries for common operations when MCP fails.
+    """
+    intent_lower = intent.lower()
+
+    # Extract conversation_id for tracking
+    conversation_id = parameters.get("conversation_id")
+
+    # Product search fallback
+    if "search" in intent_lower and "product" in intent_lower:
+        return _execute_product_search(
+            parameters.get("query", ""),
+            parameters.get("first", 20),
+            conversation_id=conversation_id
+        )
+
+    # Cart creation fallback
+    elif "create" in intent_lower and "cart" in intent_lower:
+        # Extract attribution context if provided
+        user_id = parameters.get("user_id")
+        return _execute_cart_creation(parameters.get("lines", []), conversation_id, user_id)
+
+    # Add to cart fallback (CRITICAL: Check this BEFORE "get cart" since both contain "cart")
+    elif "add" in intent_lower and "cart" in intent_lower:
+        return _execute_add_to_cart(
+            parameters.get("cart_id", ""),
+            parameters.get("lines", []),
+            conversation_id=conversation_id
+        )
+
+    # Get cart fallback
+    elif "get" in intent_lower and "cart" in intent_lower:
+        return _execute_get_cart(parameters.get("cart_id", ""))
+
+    # Modify cart fallback
+    elif "modify" in intent_lower and "cart" in intent_lower:
+        return _execute_modify_cart(parameters.get("cart_id", ""), parameters.get("lines", []))
+
+    # Apply discount fallback
+    elif "discount" in intent_lower or "coupon" in intent_lower:
+        return _execute_apply_discount(parameters.get("cart_id", ""), parameters.get("codes", []))
+
+    # Shipping calculation fallback
+    elif "shipping" in intent_lower or "delivery" in intent_lower:
+        return _execute_shipping_calculation(parameters.get("cart_id", ""), parameters.get("address", {}))
+
+    else:
+        return {
+            "status": "error",
+            "error_message": f"I don't know how to '{intent}'. Please try rephrasing your request."
+        }
+
+
+def _format_operation_result(intent: str, data: Dict[str, Any], parameters: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Format GraphQL response data into user-friendly format based on operation intent.
+    """
+    intent_lower = intent.lower()
+
+    # Format product search results
+    if "search" in intent_lower and "product" in intent_lower:
+        # Handle both GraphQL format (edges) and direct array format
+        if "edges" in data.get("products", {}):
+            # Raw GraphQL format
+            products = data.get("products", {}).get("edges", [])
+            formatted_products = []
+
+            for edge in products:
+                node = edge["node"]
+                # Extract image URL if available
+                image_url = None
+                images = node.get("images", {}).get("edges", [])
+                if images:
+                    image_url = images[0].get("node", {}).get("url")
+
+                # Create formatted product with image metadata
+                formatted_product = {
+                    **node,
+                    "primary_image_url": image_url,
+                    "has_image": bool(image_url)
+                }
+                formatted_products.append(formatted_product)
+
+            return {
+                "products": formatted_products,
+                "total_found": len(products),
+                "search_query": parameters.get("query", ""),
+                "has_images": any(p.get("has_image") for p in formatted_products)
+            }
+        else:
+            # Direct array format from fallback
+            products = data.get("products", [])
+            formatted_products = []
+
+            for product in products:
+                # Extract image URL if available
+                image_url = None
+                images = product.get("images", {}).get("edges", [])
+                if images:
+                    image_url = images[0].get("node", {}).get("url")
+
+                # Create formatted product with image metadata
+                formatted_product = {
+                    **product,
+                    "primary_image_url": image_url,
+                    "has_image": bool(image_url)
+                }
+                formatted_products.append(formatted_product)
+
+            return {
+                "products": formatted_products,
+                "total_found": len(products),
+                "search_query": parameters.get("query", ""),
+                "has_images": any(p.get("has_image") for p in formatted_products)
+            }
+    
+    # Format cart operations
+    elif "cart" in intent_lower:
+        if "cartCreate" in data:
+            cart_data = data["cartCreate"]["cart"]
+            return {
+                "cart_id": cart_data.get("id"),
+                "checkout_url": cart_data.get("checkoutUrl"),
+                "total_quantity": len(cart_data.get("lines", {}).get("edges", [])),
+                "cost": cart_data.get("cost", {})
+            }
+        elif "cartLinesAdd" in data:
+            cart_data = data["cartLinesAdd"]["cart"]
+            return {
+                "cart_id": cart_data.get("id"),
+                "checkout_url": cart_data.get("checkoutUrl"),
+                "lines": cart_data.get("lines", {}).get("edges", []),
+                "cost": cart_data.get("cost", {}),
+                "operation": "add"
+            }
+        elif "cartLinesUpdate" in data:
+            cart_data = data["cartLinesUpdate"]["cart"]
+            return {
+                "cart_id": cart_data.get("id"),
+                "checkout_url": cart_data.get("checkoutUrl"),
+                "lines": cart_data.get("lines", {}).get("edges", []),
+                "cost": cart_data.get("cost", {}),
+                "operation": "modify"
+            }
+        elif "cart" in data:
+            cart_data = data["cart"]
+            return {
+                "cart_id": cart_data.get("id"),
+                "checkout_url": cart_data.get("checkoutUrl"),
+                "lines": cart_data.get("lines", {}).get("edges", []),
+                "cost": cart_data.get("cost", {})
+            }
+    
+    # Format shipping results
+    elif "shipping" in intent_lower:
+        if "cartShippingAddressUpdate" in data:
+            cart_data = data["cartShippingAddressUpdate"]["cart"]
+            delivery_groups = cart_data.get("deliveryGroups", {}).get("edges", [])
+            
+            shipping_options = []
+            for group in delivery_groups:
+                options = group.get("node", {}).get("deliveryOptions", [])
+                shipping_options.extend(options)
+            
+            return {
+                "shipping_options": shipping_options,
+                "cart_totals": cart_data.get("cost", {}),
+                "total_options": len(shipping_options)
+            }
+    
+    # Default formatting - return raw data
+    return data
+
+
+# Fallback implementations for core operations
+def _execute_product_search(query: str, first: int = 20, conversation_id: Optional[str] = None) -> Dict[str, Any]:
+    """Fallback product search with intelligent query handling."""
+    if not query:
+        return {
+            "status": "error",
+            "error_message": "Please provide a search term to find products."
+        }
+
+    # Clean the query
+    cleaned_query = query.strip()
+
+    # If query is very generic or short, get all products
+    if not cleaned_query or len(cleaned_query) <= 2 or cleaned_query.lower() in ['*', 'all', 'any', 'product', 'item']:
+        # Get all products without filter
+        graphql_query = """
+        query getAllProducts($first: Int!) {
+            products(first: $first) {
+                edges {
+                    node {
+                        id
+                        title
+                        handle
+                        description
+                        availableForSale
+                        productType
+                        priceRange {
+                            minVariantPrice {
+                                amount
+                                currencyCode
+                            }
+                        }
+                        images(first: 1) {
+                            edges {
+                                node {
+                                    url
+                                    altText
+                                }
+                            }
+                        }
+                        variants(first: 3) {
+                            edges {
+                                node {
+                                    id
+                                    title
+                                    availableForSale
+                                    price {
+                                        amount
+                                        currencyCode
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        variables = {"first": min(first, 100)}
+    else:
+        # Use search query
+        graphql_query = """
+        query searchProducts($query: String!, $first: Int!) {
+            products(first: $first, query: $query) {
+                edges {
+                    node {
+                        id
+                        title
+                        handle
+                        description
+                        availableForSale
+                        productType
+                        priceRange {
+                            minVariantPrice {
+                                amount
+                                currencyCode
+                            }
+                        }
+                        images(first: 1) {
+                            edges {
+                                node {
+                                    url
+                                    altText
+                                }
+                            }
+                        }
+                        variants(first: 3) {
+                            edges {
+                                node {
+                                    id
+                                    title
+                                    availableForSale
+                                    price {
+                                        amount
+                                        currencyCode
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        variables = {"query": cleaned_query, "first": min(first, 100)}
+
+    result = execute_shopify_graphql(graphql_query, variables, "storefront")
+
+    if result["status"] == "success":
+        products = result["data"].get("products", {}).get("edges", [])
+
+        # If search query returned no results, try getting all products as fallback
+        if not products and cleaned_query and len(cleaned_query) > 2:
+            print(f"No products found for '{cleaned_query}', getting all products...")
+            fallback_query = """
+            query getAllProducts($first: Int!) {
+                products(first: $first) {
+                    edges {
+                        node {
+                            id
+                            title
+                            handle
+                            description
+                            availableForSale
+                            productType
+                            priceRange {
+                                minVariantPrice {
+                                    amount
+                                    currencyCode
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            """
+            fallback_result = execute_shopify_graphql(fallback_query, {"first": min(first, 100)}, "storefront")
+            if fallback_result["status"] == "success":
+                products = fallback_result["data"].get("products", {}).get("edges", [])
+
+        # Track product views for analytics
+        if _tracking_enabled and conversation_id and products:
+            try:
+                for edge in products:
+                    node = edge.get("node", {})
+                    product_id = node.get("id")
+                    product_title = node.get("title")
+                    product_type = node.get("productType")
+                    price_data = node.get("priceRange", {}).get("minVariantPrice", {})
+                    product_price = float(price_data.get("amount", 0)) if price_data.get("amount") else None
+
+                    if product_id:
+                        tracking_service.record_product_view(
+                            conversation_id=conversation_id,
+                            product_id=product_id,
+                            product_title=product_title,
+                            product_price=product_price,
+                            product_type=product_type,
+                            recommended_by_agent=True
+                        )
+                logger.info(f"Tracked {len(products)} product views for conversation {conversation_id}")
+
+                # Increment products_searched counter for funnel analytics
+                session = db_manager.get_session()
+                try:
+                    conversation = session.query(Conversation).filter_by(id=conversation_id).first()
+                    if conversation:
+                        conversation.products_searched += 1
+                        session.commit()
+                        logger.debug(f"Incremented products_searched for conversation {conversation_id}")
+                except Exception as db_error:
+                    session.rollback()
+                    logger.error(f"Failed to increment products_searched: {db_error}")
+                finally:
+                    session.close()
+
+            except Exception as e:
+                logger.error(f"Failed to track product views: {e}")
+
+        return {
+            "status": "success",
+            "products": [edge["node"] for edge in products],
+            "total_found": len(products),
+            "search_query": cleaned_query
+        }
+
+    return result
+
+
+def _execute_cart_creation(lines: List[Dict[str, Any]], conversation_id: Optional[str] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Fallback cart creation with hardcoded query.
+
+    Args:
+        lines: Cart line items
+        conversation_id: Optional conversation ID for attribution
+        user_id: Optional user ID for attribution
+    """
+    if not lines:
+        return {
+            "status": "error",
+            "error_message": "Please provide items to add to the cart."
+        }
+
+    graphql_query = """
+    mutation cartCreate($input: CartInput!) {
+        cartCreate(input: $input) {
+            cart {
+                id
+                checkoutUrl
+                attributes {
+                    key
+                    value
+                }
+                lines(first: 10) {
+                    edges {
+                        node {
+                            id
+                            quantity
+                            merchandise {
+                                ... on ProductVariant {
+                                    id
+                                    title
+                                    price {
+                                        amount
+                                        currencyCode
+                                    }
+                                    product {
+                                        title
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                cost {
+                    totalAmount {
+                        amount
+                        currencyCode
+                    }
+                }
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+
+    # Build cart input with optional attribution
+    cart_input = {"lines": lines}
+
+    # Add attribution if conversation_id and user_id provided
+    if conversation_id and user_id:
+        cart_input["attributes"] = [
+            {"key": "_agent_conversation_id", "value": conversation_id},
+            {"key": "_agent_user_id", "value": user_id},
+            {"key": "_agent_source", "value": "behold_whatsapp_agent"},
+        ]
+        logger.info(f"Creating cart with attribution: conversation={conversation_id}, user={user_id}")
+
+    variables = {"input": cart_input}
+    result = execute_shopify_graphql(graphql_query, variables, "storefront")
+
+    if result["status"] == "success":
+        cart_data = result["data"].get("cartCreate", {})
+        if cart_data.get("userErrors"):
+            return {
+                "status": "error",
+                "error_message": f"Cart creation failed: {cart_data['userErrors'][0].get('message')}"
+            }
+
+        cart = cart_data.get("cart", {})
+        cart_id = cart.get("id")
+        checkout_url = cart.get("checkoutUrl")
+        cart_lines = cart.get("lines", {}).get("edges", [])
+        cost = cart.get("cost", {})
+
+        # Track cart in database if conversation_id provided
+        if conversation_id and cart_id:
+            try:
+                from analytics import tracking_service
+                if tracking_service:
+                    # Extract cart items for tracking
+                    items = []
+                    for edge in cart_lines:
+                        node = edge.get("node", {})
+                        merchandise = node.get("merchandise", {})
+                        items.append({
+                            "product_id": merchandise.get("product", {}).get("id"),
+                            "variant_id": merchandise.get("id"),
+                            "quantity": node.get("quantity"),
+                            "title": merchandise.get("product", {}).get("title")
+                        })
+
+                    total_amount = float(cost.get("totalAmount", {}).get("amount", 0))
+                    currency = cost.get("totalAmount", {}).get("currencyCode", "USD")
+
+                    tracking_service.record_cart_creation(
+                        cart_id=cart_id,
+                        conversation_id=conversation_id,
+                        checkout_url=checkout_url,
+                        items=items,
+                        subtotal_amount=total_amount,
+                        currency=currency
+                    )
+                    logger.info(f"Cart tracked in database: {cart_id}")
+            except Exception as e:
+                logger.error(f"Failed to track cart in database: {e}")
+
+        return {
+            "status": "success",
+            "cart_id": cart_id,
+            "checkout_url": checkout_url,
+            "total_quantity": len(cart_lines),
+            "cost": cost
+        }
+    
+    return result
+
+
+def _execute_get_cart(cart_id: str) -> Dict[str, Any]:
+    """Fallback get cart with hardcoded query."""
+    if not cart_id:
+        return {
+            "status": "error", 
+            "error_message": "Please provide a cart ID."
+        }
+    
+    graphql_query = """
+    query getCart($id: ID!) {
+        cart(id: $id) {
+            id
+            checkoutUrl
+            lines(first: 50) {
+                edges {
+                    node {
+                        id
+                        quantity
+                        merchandise {
+                            ... on ProductVariant {
+                                id
+                                title
+                                price {
+                                    amount
+                                    currencyCode
+                                }
+                                product {
+                                    title
+                                    handle
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cost {
+                totalAmount {
+                    amount
+                    currencyCode
+                }
+                subtotalAmount {
+                    amount
+                    currencyCode
+                }
+            }
+        }
+    }
+    """
+    
+    variables = {"id": cart_id}
+    result = execute_shopify_graphql(graphql_query, variables, "storefront")
+    
+    if result["status"] == "success":
+        cart = result["data"].get("cart")
+        if not cart:
+            return {
+                "status": "error",
+                "error_message": "Cart not found."
+            }
+        
+        return {
+            "status": "success",
+            "cart_id": cart.get("id"),
+            "checkout_url": cart.get("checkoutUrl"),
+            "lines": cart.get("lines", {}).get("edges", []),
+            "cost": cart.get("cost", {})
+        }
+    
+    return result
+
+def _execute_add_to_cart(cart_id: str, lines: List[Dict[str, Any]], conversation_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Add NEW items to an existing cart using cartLinesAdd.
+    CRITICAL: This is DIFFERENT from cartLinesUpdate - this adds new products!
+    """
+    if not cart_id:
+        return {
+            "status": "error",
+            "error_message": "Please provide a cart ID to add items to."
+        }
+
+    if not lines:
+        return {
+            "status": "error",
+            "error_message": "Please provide items to add to the cart."
+        }
+
+    graphql_query = """
+    mutation cartLinesAdd($cartId: ID!, $lines: [CartLineInput!]!) {
+        cartLinesAdd(cartId: $cartId, lines: $lines) {
+            cart {
+                id
+                checkoutUrl
+                lines(first: 50) {
+                    edges {
+                        node {
+                            id
+                            quantity
+                            merchandise {
+                                ... on ProductVariant {
+                                    id
+                                    title
+                                    price {
+                                        amount
+                                        currencyCode
+                                    }
+                                    product {
+                                        id
+                                        title
+                                        handle
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                cost {
+                    totalAmount {
+                        amount
+                        currencyCode
+                    }
+                    subtotalAmount {
+                        amount
+                        currencyCode
+                    }
+                }
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+
+    variables = {"cartId": cart_id, "lines": lines}
+    result = execute_shopify_graphql(graphql_query, variables, "storefront")
+
+    if result["status"] == "success":
+        cart_data = result["data"].get("cartLinesAdd", {})
+        if cart_data.get("userErrors"):
+            return {
+                "status": "error",
+                "error_message": f"Adding to cart failed: {cart_data['userErrors'][0].get('message')}"
+            }
+
+        cart = cart_data.get("cart", {})
+        cart_lines = cart.get("lines", {}).get("edges", [])
+
+        # Track products added to cart
+        if _tracking_enabled and conversation_id:
+            try:
+                # Track cart update
+                items = []
+                for edge in cart_lines:
+                    node = edge.get("node", {})
+                    merchandise = node.get("merchandise", {})
+                    product = merchandise.get("product", {})
+                    product_id = product.get("id")
+
+                    items.append({
+                        "product_id": product_id,
+                        "variant_id": merchandise.get("id"),
+                        "quantity": node.get("quantity"),
+                        "title": product.get("title")
+                    })
+
+                    # Mark product as added to cart in analytics
+                    if product_id:
+                        tracking_service.mark_product_added_to_cart(
+                            conversation_id=conversation_id,
+                            product_id=product_id
+                        )
+
+                # Update cart in database
+                cost = cart.get("cost", {})
+                total_amount = float(cost.get("totalAmount", {}).get("amount", 0))
+                tracking_service.record_cart_update(
+                    cart_id=cart_id,
+                    items=items,
+                    subtotal_amount=total_amount
+                )
+                logger.info(f"Tracked cart update for conversation {conversation_id}")
+            except Exception as e:
+                logger.error(f"Failed to track cart update: {e}")
+
+        return {
+            "status": "success",
+            "cart_id": cart.get("id"),
+            "checkout_url": cart.get("checkoutUrl"),
+            "lines": cart_lines,
+            "cost": cart.get("cost", {}),
+            "operation": "add"
+        }
+
+    return result
+
+
+def _execute_modify_cart(cart_id: str, lines: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Fallback cart modification with hardcoded query."""
+    if not cart_id:
+        return {
+            "status": "error",
+            "error_message": "Please provide a cart ID."
+        }
+    
+    if not lines:
+        return {
+            "status": "error",
+            "error_message": "Please provide line items to update."
+        }
+    
+    graphql_query = """
+    mutation cartLinesUpdate($cartId: ID!, $lines: [CartLineUpdateInput!]!) {
+        cartLinesUpdate(cartId: $cartId, lines: $lines) {
+            cart {
+                id
+                checkoutUrl
+                lines(first: 50) {
+                    edges {
+                        node {
+                            id
+                            quantity
+                            merchandise {
+                                ... on ProductVariant {
+                                    id
+                                    title
+                                    price {
+                                        amount
+                                        currencyCode
+                                    }
+                                    product {
+                                        title
+                                        handle
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                cost {
+                    totalAmount {
+                        amount
+                        currencyCode
+                    }
+                    subtotalAmount {
+                        amount
+                        currencyCode
+                    }
+                }
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+    
+    variables = {"cartId": cart_id, "lines": lines}
+    result = execute_shopify_graphql(graphql_query, variables, "storefront")
+    
+    if result["status"] == "success":
+        cart_data = result["data"].get("cartLinesUpdate", {})
+        if cart_data.get("userErrors"):
+            return {
+                "status": "error",
+                "error_message": f"Cart modification failed: {cart_data['userErrors'][0].get('message')}"
+            }
+        
+        cart = cart_data.get("cart", {})
+        return {
+            "status": "success",
+            "cart_id": cart.get("id"),
+            "checkout_url": cart.get("checkoutUrl"),
+            "lines": cart.get("lines", {}).get("edges", []),
+            "cost": cart.get("cost", {})
+        }
+    
+    return result
+
+def _execute_apply_discount(cart_id: str, codes: List[str]) -> Dict[str, Any]:
+    """Fallback discount application with hardcoded query."""
+    if not cart_id or not codes:
+        return {
+            "status": "error",
+            "error_message": "Please provide both cart ID and discount codes."
+        }
+    
+    graphql_query = """
+    mutation cartDiscountCodesUpdate($cartId: ID!, $discountCodes: [String!]) {
+        cartDiscountCodesUpdate(cartId: $cartId, discountCodes: $discountCodes) {
+            cart {
+                id
+                discountCodes {
+                    code
+                    applicable
+                }
+                cost {
+                    totalAmount {
+                        amount
+                        currencyCode
+                    }
+                    subtotalAmount {
+                        amount
+                        currencyCode
+                    }
+                }
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+    
+    variables = {"cartId": cart_id, "discountCodes": codes}
+    result = execute_shopify_graphql(graphql_query, variables, "storefront")
+    
+    if result["status"] == "success":
+        discount_data = result["data"].get("cartDiscountCodesUpdate", {})
+        if discount_data.get("userErrors"):
+            return {
+                "status": "error",
+                "error_message": f"Discount application failed: {discount_data['userErrors'][0].get('message')}"
+            }
+        
+        cart = discount_data.get("cart", {})
+        applied_codes = [dc for dc in cart.get("discountCodes", []) if dc.get("applicable")]
+        
+        return {
+            "status": "success",
+            "cart_id": cart.get("id"),
+            "applied_codes": applied_codes,
+            "total_discounts": len(applied_codes),
+            "cost": cart.get("cost", {})
+        }
+    
+    return result
+
+
+def _execute_shipping_calculation(cart_id: str, address: Dict[str, str]) -> Dict[str, Any]:
+    """Modern shipping calculation using the 2025-01 CartDelivery API."""
+    if not cart_id or not address.get("country"):
+        return {
+            "status": "error",
+            "error_message": "Please provide cart ID and shipping address with at least a country."
+        }
+
+    # Step 1: Update buyer identity with country code
+    buyer_identity_query = """
+    mutation cartBuyerIdentityUpdate($cartId: ID!, $buyerIdentity: CartBuyerIdentityInput!) {
+        cartBuyerIdentityUpdate(cartId: $cartId, buyerIdentity: $buyerIdentity) {
+            cart {
+                id
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+
+    # Step 2: Add delivery address using correct 2025-01 format
+    add_delivery_address_query = """
+    mutation cartDeliveryAddressesAdd($cartId: ID!, $addresses: [CartSelectableAddressInput!]!) {
+        cartDeliveryAddressesAdd(cartId: $cartId, addresses: $addresses) {
+            cart {
+                id
+                deliveryGroups(first: 5) {
+                    edges {
+                        node {
+                            id
+                            deliveryOptions {
+                                handle
+                                title
+                                description
+                                estimatedCost {
+                                    amount
+                                    currencyCode
+                                }
+                            }
+                            selectedDeliveryOption {
+                                handle
+                                title
+                                estimatedCost {
+                                    amount
+                                    currencyCode
+                                }
+                            }
+                        }
+                    }
+                }
+                cost {
+                    totalAmount {
+                        amount
+                        currencyCode
+                    }
+                    subtotalAmount {
+                        amount
+                        currencyCode
+                    }
+                    totalTaxAmount {
+                        amount
+                        currencyCode
+                    }
+                }
+            }
+            userErrors {
+                field
+                message
+            }
+            warnings {
+                message
+            }
+        }
+    }
+    """
+
+    # Normalize country code - handle common country name variations
+    def normalize_country_code(country_input: str) -> str:
+        """Convert country names/codes to proper ISO 3166-1 alpha-2 codes"""
+        country_map = {
+            # Common variations for major countries
+            "BRAZIL": "BR",
+            "BRASIL": "BR",
+            "UNITED STATES": "US",
+            "USA": "US",
+            "AMERICA": "US",
+            "CANADA": "CA",
+            "UNITED KINGDOM": "GB",
+            "UK": "GB",
+            "ENGLAND": "GB",
+            "FRANCE": "FR",
+            "GERMANY": "DE",
+            "ITALY": "IT",
+            "SPAIN": "ES",
+            "AUSTRALIA": "AU",
+            "JAPAN": "JP",
+            "CHINA": "CN",
+            "INDIA": "IN",
+            "MEXICO": "MX",
+            "ARGENTINA": "AR",
+        }
+
+        country_upper = country_input.upper().strip()
+        return country_map.get(country_upper, country_upper)
+
+    # Normalize the country code
+    normalized_country = normalize_country_code(address.get("country", "US"))
+
+    try:
+        # Step 1: Update buyer identity with country code only
+        buyer_identity = {
+            "countryCode": normalized_country
+        }
+
+        variables = {
+            "cartId": cart_id,
+            "buyerIdentity": buyer_identity
+        }
+
+        result = execute_shopify_graphql(buyer_identity_query, variables, "storefront")
+
+        if result["status"] != "success":
+            return {
+                "status": "error",
+                "error_message": f"Failed to update buyer identity: {result.get('error_message', 'Unknown error')}"
+            }
+
+        # Check for user errors in buyer identity update
+        buyer_data = result["data"].get("cartBuyerIdentityUpdate", {})
+        user_errors = buyer_data.get("userErrors", [])
+
+        if user_errors:
+            error_details = user_errors[0]
+            return {
+                "status": "error",
+                "error_message": f"Buyer identity error: {error_details.get('message', 'Unknown error')}"
+            }
+
+        # Step 2: Create proper address structure for 2025-01 API
+        # Build CartDeliveryAddressInput format with correct field names
+        delivery_address = {
+            "countryCode": normalized_country  # Use countryCode, not country
+        }
+
+        # Add optional fields with correct field names
+        if address.get("city"):
+            delivery_address["city"] = address.get("city")
+
+        if address.get("province") or address.get("state"):
+            delivery_address["provinceCode"] = address.get("province", address.get("state", ""))  # Use provinceCode
+
+        if address.get("zip") or address.get("postal_code") or address.get("zipcode"):
+            delivery_address["zip"] = address.get("zip", address.get("postal_code", address.get("zipcode", "")))
+
+        if address.get("address1") or address.get("street"):
+            delivery_address["address1"] = address.get("address1", address.get("street", ""))
+
+        if address.get("address2") or address.get("street2"):
+            delivery_address["address2"] = address.get("address2", address.get("street2", ""))
+
+        if address.get("company"):
+            delivery_address["company"] = address.get("company")
+
+        if address.get("phone"):
+            delivery_address["phone"] = address.get("phone")
+
+        if address.get("firstName"):
+            delivery_address["firstName"] = address.get("firstName")
+
+        if address.get("lastName"):
+            delivery_address["lastName"] = address.get("lastName")
+
+        # Create CartSelectableAddressInput with proper structure
+        delivery_address_input = {
+            "address": {
+                "deliveryAddress": delivery_address
+            },
+            "selected": True,  # Mark as selected to trigger shipping calculation
+            "oneTimeUse": True  # Don't save to customer addresses
+        }
+
+        variables = {
+            "cartId": cart_id,
+            "addresses": [delivery_address_input]
+        }
+
+        result = execute_shopify_graphql(add_delivery_address_query, variables, "storefront")
+
+        if result["status"] == "success":
+            shipping_data = result["data"].get("cartDeliveryAddressesAdd", {})
+            user_errors = shipping_data.get("userErrors", [])
+
+            if user_errors:
+                error_details = user_errors[0]
+                error_message = error_details.get('message', 'Unknown error')
+                error_field = error_details.get('field', '')
+
+                # Provide more helpful error messages for common issues
+                if 'country' in error_message.lower() or 'country' in error_field.lower():
+                    return {
+                        "status": "error",
+                        "error_message": f"Invalid country code '{normalized_country}'. Please use a valid country (e.g., Brazil=BR, United States=US, etc.)"
+                    }
+                elif 'address' in error_message.lower():
+                    return {
+                        "status": "error",
+                        "error_message": f"Address format issue: {error_message}. Please provide at least country and city."
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "error_message": f"Shipping calculation failed: {error_message}"
+                    }
+
+            # Check for warnings (non-critical issues)
+            warnings = shipping_data.get("warnings", [])
+            warning_messages = [w.get("message", "") for w in warnings] if warnings else []
+
+            cart = shipping_data.get("cart", {})
+            delivery_groups = cart.get("deliveryGroups", {}).get("edges", [])
+
+            # Extract shipping options
+            shipping_options = []
+            for group_edge in delivery_groups:
+                group = group_edge.get("node", {})
+                options = group.get("deliveryOptions", [])
+
+                for option in options:
+                    estimated_cost = option.get("estimatedCost", {})
+                    shipping_options.append({
+                        "handle": option.get("handle", ""),
+                        "title": option.get("title", "Standard Shipping"),
+                        "description": option.get("description", ""),
+                        "estimatedCost": estimated_cost
+                    })
+
+            return {
+                "status": "success",
+                "shipping_options": shipping_options,
+                "total_options": len(shipping_options),
+                "cart_totals": cart.get("cost", {}),
+                "normalized_country": normalized_country,
+                "warnings": warning_messages,
+                "delivery_address_used": delivery_address  # For debugging
+            }
+
+        return {
+            "status": "error",
+            "error_message": f"Shipping calculation failed: {result.get('error_message', 'Unknown error')}. Country used: {normalized_country}"
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Unexpected error during shipping calculation: {str(e)}"
+        }
+
+
+# =============================================================================
+# EXPORTED API FUNCTIONS
+# =============================================================================
+# Only the essential functions are exported - all operations go through execute_shopify_operation
+
+# Legacy compatibility functions (kept for agent tool compatibility)
+def fetch_shopify_graphql(query: str, variables: Optional[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
+    """Legacy compatibility wrapper for direct GraphQL execution."""
+    if variables is None:
+        variables = {}
+    return execute_shopify_graphql(query, variables, api="admin", **kwargs)
+
+
+def fetch_shopify_storefront_graphql(query: str, variables: Optional[Dict[str, Any]], **kwargs) -> Dict[str, Any]:
+    """Legacy compatibility wrapper for direct GraphQL execution."""
+    if variables is None:
+        variables = {}
+    return execute_shopify_graphql(query, variables, api="storefront", **kwargs)
+
+
+def validate_graphql_with_mcp(query: str, api: str, **kwargs) -> Dict[str, Any]:
+    """Legacy compatibility wrapper for GraphQL validation."""
+    if not api:
+        api = "admin"
+    return validate_graphql_query(query, api)
+
+
+def introspect_graphql_schema(search_term: str, api: str, **kwargs) -> Dict[str, Any]:
+    """Legacy compatibility wrapper for schema introspection."""
+    if not api:
+        api = "admin"
+    return introspect_shopify_schema(search_term, api)
+
+
+def get_store_info() -> Dict[str, Any]:
+    """
+    Get basic store information including name and available product types.
+    This helps the agent understand what it's actually selling.
+    """
+    try:
+        logger.info("Fetching store information...")
+
+        # Query to get store info and product categories
+        store_query = """
+        query getStoreInfo {
+            shop {
+                name
+                description
+                primaryDomain {
+                    host
+                }
+            }
+            products(first: 100) {
+                edges {
+                    node {
+                        productType
+                        vendor
+                        tags
+                    }
+                }
+            }
+        }
+        """
+
+        result = execute_shopify_graphql(store_query, {}, "storefront")
+
+        if result["status"] == "success":
+            data = result["data"]
+            shop = data.get("shop", {})
+            products = data.get("products", {}).get("edges", [])
+
+            # Extract unique product types and categories
+            product_types = set()
+            vendors = set()
+            tags = set()
+
+            for edge in products:
+                node = edge.get("node", {})
+                if node.get("productType"):
+                    product_types.add(node["productType"])
+                if node.get("vendor"):
+                    vendors.add(node["vendor"])
+                if node.get("tags"):
+                    for tag in node["tags"]:
+                        tags.add(tag)
+
+            store_info = {
+                "status": "success",
+                "name": shop.get("name", "Our Store"),
+                "description": shop.get("description", ""),
+                "domain": shop.get("primaryDomain", {}).get("host", ""),
+                "product_types": list(product_types),
+                "vendors": list(vendors),
+                "tags": list(tags),
+                "total_products": len(products)
+            }
+
+            logger.info(f"Store info fetched successfully: {shop.get('name')} with {len(products)} products")
+            return store_info
+
+        logger.error(f"Failed to fetch store info: {result.get('error_message')}")
+        return {
+            "status": "error",
+            "error_message": f"Failed to fetch store info: {result.get('error_message', 'Unknown error')}"
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting store info: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "error_message": f"Error getting store info: {str(e)}"
         }
