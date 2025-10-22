@@ -7,6 +7,10 @@ import logging
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Dict, Any
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
