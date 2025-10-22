@@ -644,6 +644,14 @@ def _fallback_operation(intent: str, parameters: Dict[str, Any], api: str) -> Di
     elif "modify" in intent_lower and "cart" in intent_lower:
         return _execute_modify_cart(parameters.get("cart_id", ""), parameters.get("lines", []))
 
+    # List active discounts fallback
+    elif ("list" in intent_lower or "show" in intent_lower or "get" in intent_lower) and ("discount" in intent_lower or "promotion" in intent_lower or "offer" in intent_lower):
+        return _execute_list_discounts(parameters.get("filter"))
+
+    # Search specific discount code fallback
+    elif "search" in intent_lower and ("discount" in intent_lower or "code" in intent_lower):
+        return _execute_search_discount_code(parameters.get("code", ""))
+
     # Apply discount fallback
     elif "discount" in intent_lower or "coupon" in intent_lower:
         return _execute_apply_discount(parameters.get("cart_id", ""), parameters.get("codes", []))
@@ -1442,6 +1450,468 @@ def _execute_apply_discount(cart_id: str, codes: List[str]) -> Dict[str, Any]:
         }
     
     return result
+
+
+def _execute_list_discounts(filter_param: Optional[str] = None) -> Dict[str, Any]:
+    """
+    List all active discounts and promotions from the store.
+
+    Args:
+        filter_param: Optional filter (e.g., "code", "automatic", "percentage", "fixed_amount")
+
+    Returns:
+        Dict containing active discounts with their details
+    """
+    try:
+        # Build query filter
+        query_filter = "status:active"
+
+        if filter_param:
+            filter_lower = filter_param.lower()
+            if filter_lower in ["code", "automatic"]:
+                query_filter += f" method:{filter_lower}"
+            elif filter_lower in ["percentage", "fixed_amount"]:
+                query_filter += f" type:{filter_lower}"
+            elif filter_lower in ["product", "shipping", "order"]:
+                query_filter += f" discount_class:{filter_lower}"
+
+        # GraphQL query to get active discounts
+        graphql_query = """
+        query getActiveDiscounts($query: String!, $first: Int!) {
+            discountNodes(query: $query, first: $first) {
+                edges {
+                    node {
+                        id
+                        discount {
+                            __typename
+                            ... on DiscountCodeBasic {
+                                title
+                                status
+                                summary
+                                codes(first: 10) {
+                                    edges {
+                                        node {
+                                            code
+                                        }
+                                    }
+                                }
+                                customerGets {
+                                    value {
+                                        ... on DiscountPercentage {
+                                            percentage
+                                        }
+                                        ... on DiscountAmount {
+                                            amount {
+                                                amount
+                                                currencyCode
+                                            }
+                                        }
+                                    }
+                                }
+                                minimumRequirement {
+                                    ... on DiscountMinimumQuantity {
+                                        greaterThanOrEqualToQuantity
+                                    }
+                                    ... on DiscountMinimumSubtotal {
+                                        greaterThanOrEqualToSubtotal {
+                                            amount
+                                            currencyCode
+                                        }
+                                    }
+                                }
+                                startsAt
+                                endsAt
+                            }
+                            ... on DiscountAutomaticBasic {
+                                title
+                                status
+                                summary
+                                customerGets {
+                                    value {
+                                        ... on DiscountPercentage {
+                                            percentage
+                                        }
+                                        ... on DiscountAmount {
+                                            amount {
+                                                amount
+                                                currencyCode
+                                            }
+                                        }
+                                    }
+                                }
+                                minimumRequirement {
+                                    ... on DiscountMinimumQuantity {
+                                        greaterThanOrEqualToQuantity
+                                    }
+                                    ... on DiscountMinimumSubtotal {
+                                        greaterThanOrEqualToSubtotal {
+                                            amount
+                                            currencyCode
+                                        }
+                                    }
+                                }
+                                startsAt
+                                endsAt
+                            }
+                            ... on DiscountCodeFreeShipping {
+                                title
+                                status
+                                summary
+                                codes(first: 10) {
+                                    edges {
+                                        node {
+                                            code
+                                        }
+                                    }
+                                }
+                                minimumRequirement {
+                                    ... on DiscountMinimumQuantity {
+                                        greaterThanOrEqualToQuantity
+                                    }
+                                    ... on DiscountMinimumSubtotal {
+                                        greaterThanOrEqualToSubtotal {
+                                            amount
+                                            currencyCode
+                                        }
+                                    }
+                                }
+                                startsAt
+                                endsAt
+                            }
+                            ... on DiscountAutomaticFreeShipping {
+                                title
+                                status
+                                summary
+                                minimumRequirement {
+                                    ... on DiscountMinimumQuantity {
+                                        greaterThanOrEqualToQuantity
+                                    }
+                                    ... on DiscountMinimumSubtotal {
+                                        greaterThanOrEqualToSubtotal {
+                                            amount
+                                            currencyCode
+                                        }
+                                    }
+                                }
+                                startsAt
+                                endsAt
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+
+        variables = {"query": query_filter, "first": 50}
+        result = execute_shopify_graphql(graphql_query, variables, "admin")
+
+        if result["status"] == "success":
+            discount_edges = result["data"].get("discountNodes", {}).get("edges", [])
+
+            code_discounts = []
+            automatic_discounts = []
+
+            for edge in discount_edges:
+                node = edge.get("node", {})
+                discount = node.get("discount", {})
+                discount_type = discount.get("__typename", "")
+
+                # Extract common fields
+                discount_info = {
+                    "id": node.get("id"),
+                    "title": discount.get("title", "Untitled Discount"),
+                    "status": discount.get("status", "ACTIVE"),
+                    "summary": discount.get("summary", ""),
+                    "type": discount_type,
+                    "starts_at": discount.get("startsAt"),
+                    "ends_at": discount.get("endsAt")
+                }
+
+                # Extract discount value
+                customer_gets = discount.get("customerGets", {})
+                value = customer_gets.get("value", {})
+                if "percentage" in value:
+                    discount_info["discount_value"] = f"{value['percentage']}% off"
+                elif "amount" in value:
+                    amount_data = value["amount"]
+                    discount_info["discount_value"] = f"{amount_data['amount']} {amount_data['currencyCode']} off"
+                elif "FreeShipping" in discount_type:
+                    discount_info["discount_value"] = "Free shipping"
+
+                # Extract minimum requirements
+                min_req = discount.get("minimumRequirement", {})
+                if min_req:
+                    if "greaterThanOrEqualToQuantity" in min_req:
+                        discount_info["minimum_requirement"] = f"Min {min_req['greaterThanOrEqualToQuantity']} items"
+                    elif "greaterThanOrEqualToSubtotal" in min_req:
+                        subtotal = min_req["greaterThanOrEqualToSubtotal"]
+                        discount_info["minimum_requirement"] = f"Min {subtotal['amount']} {subtotal['currencyCode']}"
+
+                # Extract discount codes if available
+                if "DiscountCode" in discount_type:
+                    codes = discount.get("codes", {}).get("edges", [])
+                    discount_info["codes"] = [c.get("node", {}).get("code") for c in codes]
+                    code_discounts.append(discount_info)
+                else:
+                    automatic_discounts.append(discount_info)
+
+            return {
+                "status": "success",
+                "total_discounts": len(discount_edges),
+                "code_discounts": code_discounts,
+                "automatic_discounts": automatic_discounts,
+                "filter_applied": filter_param
+            }
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error listing discounts: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "error_message": f"Failed to retrieve discounts: {str(e)}"
+        }
+
+
+def _execute_search_discount_code(code: str) -> Dict[str, Any]:
+    """
+    Search for a specific discount code and validate it.
+
+    Args:
+        code: The discount code to search for
+
+    Returns:
+        Dict containing discount code details if found
+    """
+    if not code:
+        return {
+            "status": "error",
+            "error_message": "Please provide a discount code to search for."
+        }
+
+    try:
+        # GraphQL query to search for specific discount code
+        graphql_query = """
+        query getDiscountByCode($code: String!) {
+            codeDiscountNodeByCode(code: $code) {
+                id
+                codeDiscount {
+                    __typename
+                    ... on DiscountCodeBasic {
+                        title
+                        status
+                        summary
+                        codes(first: 1) {
+                            edges {
+                                node {
+                                    code
+                                }
+                            }
+                        }
+                        customerGets {
+                            value {
+                                ... on DiscountPercentage {
+                                    percentage
+                                }
+                                ... on DiscountAmount {
+                                    amount {
+                                        amount
+                                        currencyCode
+                                    }
+                                }
+                            }
+                            items {
+                                __typename
+                            }
+                        }
+                        minimumRequirement {
+                            ... on DiscountMinimumQuantity {
+                                greaterThanOrEqualToQuantity
+                            }
+                            ... on DiscountMinimumSubtotal {
+                                greaterThanOrEqualToSubtotal {
+                                    amount
+                                    currencyCode
+                                }
+                            }
+                        }
+                        startsAt
+                        endsAt
+                        usageLimit
+                        appliesOncePerCustomer
+                    }
+                    ... on DiscountCodeBxgy {
+                        title
+                        status
+                        summary
+                        codes(first: 1) {
+                            edges {
+                                node {
+                                    code
+                                }
+                            }
+                        }
+                        customerGets {
+                            value {
+                                ... on DiscountPercentage {
+                                    percentage
+                                }
+                                ... on DiscountAmount {
+                                    amount {
+                                        amount
+                                        currencyCode
+                                    }
+                                }
+                                ... on DiscountOnQuantity {
+                                    quantity {
+                                        quantity
+                                    }
+                                }
+                            }
+                        }
+                        customerBuys {
+                            value {
+                                ... on DiscountQuantity {
+                                    quantity
+                                }
+                            }
+                        }
+                        startsAt
+                        endsAt
+                        usageLimit
+                    }
+                    ... on DiscountCodeFreeShipping {
+                        title
+                        status
+                        summary
+                        codes(first: 1) {
+                            edges {
+                                node {
+                                    code
+                                }
+                            }
+                        }
+                        minimumRequirement {
+                            ... on DiscountMinimumQuantity {
+                                greaterThanOrEqualToQuantity
+                            }
+                            ... on DiscountMinimumSubtotal {
+                                greaterThanOrEqualToSubtotal {
+                                    amount
+                                    currencyCode
+                                }
+                            }
+                        }
+                        startsAt
+                        endsAt
+                        appliesOncePerCustomer
+                    }
+                }
+            }
+        }
+        """
+
+        variables = {"code": code.strip().upper()}
+        result = execute_shopify_graphql(graphql_query, variables, "admin")
+
+        if result["status"] == "success":
+            discount_node = result["data"].get("codeDiscountNodeByCode")
+
+            if not discount_node:
+                return {
+                    "status": "not_found",
+                    "code": code,
+                    "error_message": f"Discount code '{code}' not found or is not active."
+                }
+
+            discount = discount_node.get("codeDiscount", {})
+            discount_type = discount.get("__typename", "")
+            status = discount.get("status", "")
+
+            # Check if discount is active
+            if status != "ACTIVE":
+                return {
+                    "status": "inactive",
+                    "code": code,
+                    "error_message": f"Discount code '{code}' exists but is not currently active (status: {status})."
+                }
+
+            # Build discount info
+            discount_info = {
+                "status": "success",
+                "code": code,
+                "id": discount_node.get("id"),
+                "title": discount.get("title", ""),
+                "summary": discount.get("summary", ""),
+                "discount_status": status,
+                "type": discount_type,
+                "starts_at": discount.get("startsAt"),
+                "ends_at": discount.get("endsAt"),
+                "usage_limit": discount.get("usageLimit"),
+                "applies_once_per_customer": discount.get("appliesOncePerCustomer", False)
+            }
+
+            # Extract discount value based on type
+            if "DiscountCodeBasic" in discount_type:
+                customer_gets = discount.get("customerGets", {})
+                value = customer_gets.get("value", {})
+
+                if "percentage" in value:
+                    discount_info["discount_value"] = f"{value['percentage']}% off"
+                    discount_info["discount_type_detail"] = "percentage"
+                    discount_info["discount_amount"] = value['percentage']
+                elif "amount" in value:
+                    amount_data = value["amount"]
+                    discount_info["discount_value"] = f"{amount_data['amount']} {amount_data['currencyCode']} off"
+                    discount_info["discount_type_detail"] = "fixed_amount"
+                    discount_info["discount_amount"] = float(amount_data['amount'])
+                    discount_info["currency"] = amount_data['currencyCode']
+
+            elif "DiscountCodeBxgy" in discount_type:
+                customer_buys = discount.get("customerBuys", {}).get("value", {})
+                customer_gets = discount.get("customerGets", {}).get("value", {})
+
+                buy_qty = customer_buys.get("quantity", 1)
+
+                if "quantity" in customer_gets:
+                    get_qty = customer_gets["quantity"].get("quantity", 1)
+                    discount_info["discount_value"] = f"Buy {buy_qty} get {get_qty} free"
+                    discount_info["discount_type_detail"] = "buy_x_get_y"
+                elif "percentage" in customer_gets:
+                    discount_info["discount_value"] = f"Buy {buy_qty} get {customer_gets['percentage']}% off"
+                    discount_info["discount_type_detail"] = "buy_x_get_y_percentage"
+
+            elif "DiscountCodeFreeShipping" in discount_type:
+                discount_info["discount_value"] = "Free shipping"
+                discount_info["discount_type_detail"] = "free_shipping"
+
+            # Extract minimum requirements
+            min_req = discount.get("minimumRequirement", {})
+            if min_req:
+                if "greaterThanOrEqualToQuantity" in min_req:
+                    min_qty = min_req["greaterThanOrEqualToQuantity"]
+                    discount_info["minimum_requirement"] = f"Minimum {min_qty} items required"
+                    discount_info["minimum_quantity"] = min_qty
+                elif "greaterThanOrEqualToSubtotal" in min_req:
+                    subtotal = min_req["greaterThanOrEqualToSubtotal"]
+                    discount_info["minimum_requirement"] = f"Minimum purchase of {subtotal['amount']} {subtotal['currencyCode']}"
+                    discount_info["minimum_subtotal"] = float(subtotal['amount'])
+                    discount_info["minimum_currency"] = subtotal['currencyCode']
+            else:
+                discount_info["minimum_requirement"] = "No minimum requirement"
+
+            return discount_info
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error searching discount code '{code}': {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "code": code,
+            "error_message": f"Failed to search discount code: {str(e)}"
+        }
 
 
 def _execute_shipping_calculation(cart_id: str, address: Dict[str, str]) -> Dict[str, Any]:
