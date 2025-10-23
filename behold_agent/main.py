@@ -46,7 +46,7 @@ try:
     from agent.agent import root_agent
     from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
-    from google.adk.messages import Content, Part
+    from google.genai.types import Content, Part
     from agent.session_context import context_manager
 
     agent_available = True
